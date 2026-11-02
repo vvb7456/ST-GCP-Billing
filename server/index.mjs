@@ -288,10 +288,9 @@ export async function init(router) {
     router.post('/summary', (req, res) => {
         const since = Number(req.body?.since) || 0;
         const todaySince = Number(req.body?.todaySince) || 0;
-        const after = Number(req.body?.afterTs) || 0;
         res.json({
             ...summarize(since, todaySince),
-            latest: records.filter(r => r.ts > after).slice(-20),
+            latest: records.slice(-20),
             lastTs: records.at(-1)?.ts ?? 0,
         });
     });

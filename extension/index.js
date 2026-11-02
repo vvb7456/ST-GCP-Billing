@@ -1,6 +1,6 @@
 const API = '/api/plugins/agent-platform-billing';
 const MODULE = 'agent_platform_billing';
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const REPO_URL = 'https://github.com/vvb7456/ST-GCP-Billing';
 
 const TABS = [
@@ -416,6 +416,7 @@ async function openPriceEditor(key = '', presetModel = '') {
 
             if (on('hasLong')) {
                 if (!(val('longContextThreshold') > 0)) return err('请填写长上下文阈值');
+                if (val('long.input') === undefined || val('long.output') === undefined) return err('长上下文的输入和输出必填');
                 apply(['longContextThreshold', 'long.input', 'long.output', 'long.cachedInput']);
             } else { delete out.longContextThreshold; delete out.long; }
 
@@ -546,7 +547,6 @@ async function refresh({ toastNew = false } = {}) {
         state.summary = await api('/summary', {
             since: periodSince(state.period),
             todaySince: periodSince('today'),
-            afterTs: state.lastSeenTs ?? 0,
         });
         state.connected = true;
     } catch (e) {
@@ -555,17 +555,22 @@ async function refresh({ toastNew = false } = {}) {
         state.summary = null;
     }
 
-    if (state.connected && toastNew && state.lastSeenTs !== null && prefs().toast) {
-        for (const r of state.summary.latest) {
-            const u = r.usage || {};
-            toastr.info(
-                `${esc(r.model)}<br>输入 ${fmt(u.promptTokenCount)} · 输出 ${fmt(u.candidatesTokenCount)}${u.thoughtsTokenCount ? ` · 思考 ${fmt(u.thoughtsTokenCount)}` : ''}<br>今日累计 ${money(state.summary.today.cost)}`,
-                `本次花费 ${r.cost ? usd(r.cost.total) : '未定价'}`,
-                { timeOut: 6000, escapeHtml: false },
-            );
+    if (state.connected) {
+        if (state.lastSeenTs === null || !prefs().toast) {
+            state.lastSeenTs = state.summary.lastTs;
+        } else if (toastNew) {
+            for (const r of state.summary.latest) {
+                if (r.ts <= state.lastSeenTs) continue;
+                const u = r.usage || {};
+                toastr.info(
+                    `${esc(r.model)}<br>输入 ${fmt(u.promptTokenCount)} · 输出 ${fmt(u.candidatesTokenCount)}${u.thoughtsTokenCount ? ` · 思考 ${fmt(u.thoughtsTokenCount)}` : ''}<br>今日累计 ${money(state.summary.today.cost)}`,
+                    `本次花费 ${r.cost ? usd(r.cost.total) : '未定价'}`,
+                    { timeOut: 6000, escapeHtml: false },
+                );
+            }
+            state.lastSeenTs = state.summary.lastTs;
         }
     }
-    if (state.connected) state.lastSeenTs = state.summary.lastTs;
 
     updateHeader();
     renderTab(state.tab);

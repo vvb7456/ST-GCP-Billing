@@ -6,6 +6,6 @@
     "js": "extension/index.js",
     "css": "extension/style.css",
     "author": "vvb7456",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "homePage": "https://github.com/vvb7456/ST-GCP-Billing"
 }

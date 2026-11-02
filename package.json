@@ -1,6 +1,6 @@
 {
     "name": "agent-platform-billing",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "private": true,
     "description": "SillyTavern Agent Platform 实时用量与费用统计服务端插件",
     "main": "server/index.mjs",
