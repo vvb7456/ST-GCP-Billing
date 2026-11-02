@@ -2,6 +2,8 @@
 
 SillyTavern 扩展与服务端插件。实时记录 Google Cloud Agent Platform（原 Vertex AI）每次调用的官方精确 Token 用量并计算花费，支持按时间段与模型汇总、明细查询、自定义模型定价、汇率折算与请求后花费提示。
 
+![Agent Platform 费用统计](./screenshot.png)
+
 ## 组成
 
 同一个仓库同时是前端扩展和服务端插件，两部分都需要安装：
