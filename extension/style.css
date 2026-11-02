@@ -1,0 +1,19 @@
+.vertex-billing-settings .vb-cards { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+.vertex-billing-settings .vb-card { flex: 1 1 200px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 6px; padding: 6px 8px; }
+.vertex-billing-settings .vb-card-title { opacity: 0.7; font-size: 0.9em; }
+.vertex-billing-settings .vb-cost { font-size: 1.3em; font-weight: bold; }
+.vertex-billing-settings .vb-sub { font-size: 0.85em; opacity: 0.8; }
+.vertex-billing-settings .vb-warn { color: var(--warning, #e8a33d); font-size: 0.85em; }
+.vertex-billing-settings .vb-scroll { overflow-x: auto; max-width: 100%; }
+.vertex-billing-settings .vb-tall { max-height: 260px; overflow-y: auto; }
+.vertex-billing-settings .vb-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+.vertex-billing-settings .vb-table th,
+.vertex-billing-settings .vb-table td { border-bottom: 1px solid var(--SmartThemeBorderColor); padding: 2px 4px; text-align: right; white-space: nowrap; }
+.vertex-billing-settings .vb-table th:first-child,
+.vertex-billing-settings .vb-table td:first-child,
+.vertex-billing-settings #vb_records td:nth-child(2) { text-align: left; }
+.vertex-billing-settings .vb-pricing input.vb-num { width: 6em; margin: 0; }
+.vertex-billing-settings .vb-pricing input.vb-key { width: 12em; margin: 0; }
+.vertex-billing-settings .vb-rate { width: 7em; margin: 0 4px; }
+.vertex-billing-settings h4 { margin: 10px 0 4px; }
+

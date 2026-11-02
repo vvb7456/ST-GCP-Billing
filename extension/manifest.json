@@ -1,0 +1,12 @@
+{
+    "display_name": "Vertex AI 精确计费",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ST-GCP-Billing",
+    "version": "1.0.0",
+    "homePage": ""
+}
+
