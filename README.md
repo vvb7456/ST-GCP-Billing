@@ -1,6 +1,6 @@
-# ST-GCP-Billing：SillyTavern Agent Platform 费用统计插件
+# Agent Platform 费用统计 (ST-GCP-Billing)
 
-直接读取 Agent Platform（原 Vertex AI）每次响应里的官方 `usageMetadata` 进行计费，不使用任何 Tokenizer 估算。
+SillyTavern 扩展与服务端插件。实时记录 Google Cloud Agent Platform（原 Vertex AI）每次调用的官方精确 Token 用量并计算花费，支持按时间段与模型汇总、明细查询、自定义模型定价、汇率折算与请求后花费提示。
 
 ## 组成
 
@@ -71,16 +71,11 @@ enableServerPlugins: true
 - 只按官方标准价计费，限时优惠（赠金返还）不计入；
 - 按 `promptTokensDetails` 等的模态区分音频输入、图片输出价格（未填写则按普通价）。
 
-## 测试
+## 许可证
 
-```bash
-node --test tests/pricing.test.mjs                 # 计价单元测试
-node tests/mock-vertex.mjs &                       # 模拟 Vertex（端口 9444）
-# 用独立 config（enableServerPlugins: true）启动测试酒馆，并设置环境变量 AGENT_PLATFORM_BILLING_TEST_HOSTS=127.0.0.1
-ST_URL=http://127.0.0.1:9333 [ST_AUTH=用户:密码] node tests/e2e.mjs    # 端到端测试
-```
+[AGPLv3](./LICENSE)
 
-## 许可
+## 仓库
 
-AGPL-3.0-or-later · [艾萝工坊](https://www.erocraft.com) © 2015 - 2026
+[github.com/vvb7456/ST-GCP-Billing](https://github.com/vvb7456/ST-GCP-Billing)
 

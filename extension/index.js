@@ -507,7 +507,7 @@ function renderSettings() {
         <div class="vb-row">
             <div class="vb-row-info">
                 <div class="vb-row-title">清零统计</div>
-                <div class="vb-row-desc">当前账本会归档为备份文件，统计从零开始</div>
+                <div class="vb-row-desc">清空所有历史请求记录，统计从零开始</div>
             </div>
             <div class="menu_button menu_button_icon vb-btn vb-btn-danger" data-action="reset"><i class="fa-solid fa-eraser"></i><span>清零</span></div>
         </div>
@@ -516,7 +516,7 @@ function renderSettings() {
             <div class="vb-about-icon"><i class="fa-solid fa-receipt"></i></div>
             <div class="vb-about-name">Agent Platform 费用统计</div>
             <div class="vb-about-version">Version ${VERSION}</div>
-            <div class="vb-about-desc">读取 Agent Platform 响应中的官方用量数据计费，不做任何估算</div>
+            <div class="vb-about-desc">SillyTavern Agent Platform 实时用量与费用统计扩展</div>
             <a href="${REPO_URL}" target="_blank" rel="noopener" class="vb-about-link">
                 <i class="fa-brands fa-github"></i>
                 <span>GitHub</span>
@@ -615,7 +615,7 @@ function bindEvents() {
     });
     $r.on('click', '[data-action="reset"]', async () => {
         const { Popup, POPUP_RESULT } = ctx();
-        if (await Popup.show.confirm('清零 Agent Platform 费用统计？', '当前账本会归档为备份文件（在插件 data 目录下），统计从零开始。') !== POPUP_RESULT.AFFIRMATIVE) return;
+        if (await Popup.show.confirm('清零 Agent Platform 费用统计？', '所有历史请求记录将被清空，此操作不可恢复。') !== POPUP_RESULT.AFFIRMATIVE) return;
         try {
             await api('/reset');
             state.lastSeenTs = null;

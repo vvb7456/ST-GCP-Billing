@@ -277,7 +277,7 @@ function summarize(since, todaySince) {
 export const info = {
     id: 'agent-platform-billing',
     name: 'Agent Platform 费用统计',
-    description: 'Records exact Agent Platform (Vertex AI) token usage from upstream usageMetadata and computes cost.',
+    description: 'SillyTavern Agent Platform 实时用量与费用统计服务端插件',
 };
 
 export async function init(router) {
@@ -324,11 +324,8 @@ export async function init(router) {
     });
 
     router.post('/reset', (_req, res) => {
-        if (fs.existsSync(LEDGER_FILE) && records.length) {
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-            fs.renameSync(LEDGER_FILE, path.join(DATA_DIR, `ledger-${stamp}.jsonl.bak`));
-        }
         records = [];
+        rewriteLedger();
         res.json({ ok: true });
     });
 }

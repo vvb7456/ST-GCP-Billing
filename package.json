@@ -2,7 +2,7 @@
     "name": "agent-platform-billing",
     "version": "1.2.0",
     "private": true,
-    "description": "SillyTavern server plugin: exact Agent Platform (Vertex AI) usage and cost tracking",
+    "description": "SillyTavern Agent Platform 实时用量与费用统计服务端插件",
     "main": "server/index.mjs",
     "license": "AGPL-3.0-or-later"
 }
