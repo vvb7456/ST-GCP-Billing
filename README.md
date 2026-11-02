@@ -4,21 +4,53 @@
 
 ## 组成
 
-| 目录 | 安装位置 | 作用 |
-| --- | --- | --- |
-| `server/` | `SillyTavern/plugins/agent-platform-billing/` | 服务端插件：截获 Vertex 原始响应，记账、算价、提供 API |
-| `extension/` | `SillyTavern/public/scripts/extensions/third-party/agent-platform-billing/` | 前端扩展：汇总面板、定价表、清零、每次请求弹窗 |
+同一个仓库同时是前端扩展和服务端插件，两部分都需要安装：
 
-两个目录都已被 SillyTavern 的 `.gitignore` 忽略，不会影响 `git pull`。
+| 部分 | 入口 | 作用 |
+| --- | --- | --- |
+| 前端扩展 | `manifest.json` → `extension/` | 汇总面板、明细、定价表、清零、每次请求后的花费提示 |
+| 服务端插件 | `package.json` → `server/index.mjs` | 截获 Agent Platform 原始响应，记账、算价、提供接口 |
+
+安装位置都在酒馆的第三方目录里，不修改酒馆本身的文件，不影响酒馆 `git pull`。
 
 ## 安装
 
-```bash
-./install.sh /opt/sillytavern-player/SillyTavern
-# 在 SillyTavern/config.yaml 中设置 enableServerPlugins: true，然后重启酒馆
+### 1. 前端扩展
+
+酒馆 → 扩展 → 安装扩展，填入：
+
+```
+https://github.com/vvb7456/ST-GCP-Billing
 ```
 
-账本和定价保存在 `plugins/agent-platform-billing/data/`（`ledger.jsonl`、`settings.json`），重新安装不会覆盖。
+### 2. 服务端插件
+
+酒馆的扩展安装界面只能安装前端扩展，服务端插件需要在服务器上操作一次。任选一种：
+
+**方式 A：用酒馆自带的插件安装命令（推荐，可自动更新）**
+
+```bash
+cd SillyTavern
+node plugins.js install https://github.com/vvb7456/ST-GCP-Billing
+```
+
+`config.yaml` 中 `enableServerPluginsAutoUpdate: true`（默认）时，酒馆每次启动都会自动拉取插件更新。
+
+**方式 B：下载 Release 压缩包**
+
+从 [Releases](https://github.com/vvb7456/ST-GCP-Billing/releases) 下载 `agent-platform-billing-server-*.zip`，解压到 `SillyTavern/plugins/` 下，得到 `plugins/agent-platform-billing/`。
+
+### 3. 启用服务端插件并重启
+
+在 `SillyTavern/config.yaml` 中设置：
+
+```yaml
+enableServerPlugins: true
+```
+
+重启酒馆。启动日志出现 `[agent-platform-billing] hooks installed` 即表示加载成功，扩展面板"设置"页会显示"已连接"。
+
+账本和定价保存在插件目录的 `server/data/`（方式 A）或 `data/`（方式 B）下，更新插件不会覆盖。
 
 ## 原理
 
@@ -47,4 +79,8 @@ node tests/mock-vertex.mjs &                       # 模拟 Vertex（端口 9444
 # 用独立 config（enableServerPlugins: true）启动测试酒馆，并设置环境变量 AGENT_PLATFORM_BILLING_TEST_HOSTS=127.0.0.1
 ST_URL=http://127.0.0.1:9333 [ST_AUTH=用户:密码] node tests/e2e.mjs    # 端到端测试
 ```
+
+## 许可
+
+AGPL-3.0-or-later · [艾萝工坊](https://www.erocraft.com) © 2015 - 2026
 

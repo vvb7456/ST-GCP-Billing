@@ -149,7 +149,7 @@ function disconnectedHtml() {
     return `<div class="vb-empty">
         <i class="fa-solid fa-plug-circle-xmark vb-empty-icon vb-danger"></i>
         <div class="vb-empty-title">未连接到服务端插件</div>
-        <div class="vb-empty-desc">请确认已把 <code>agent-platform-billing</code> 放入酒馆的 <code>plugins</code> 目录，<br>并在 <code>config.yaml</code> 中设置 <code>enableServerPlugins: true</code> 后重启酒馆。</div>
+        <div class="vb-empty-desc">前端扩展需要配合服务端插件使用。请在酒馆目录下执行<br><code>node plugins.js install ${REPO_URL}</code><br>并在 <code>config.yaml</code> 中设置 <code>enableServerPlugins: true</code> 后重启酒馆。<br><a href="${REPO_URL}#安装" target="_blank" rel="noopener">查看安装说明</a></div>
         <div class="menu_button menu_button_icon vb-btn" data-action="retry"><i class="fa-solid fa-rotate"></i><span>重试</span></div>
     </div>`;
 }
@@ -465,7 +465,7 @@ function renderSettings() {
     const s = state.summary;
     const statusDesc = state.connected
         ? `已连接 · 共 ${fmt(s?.total.requests)} 条记录${s?.firstTs ? ` · 统计起点 ${new Date(s.firstTs).toLocaleDateString()}` : ''}`
-        : '未连接：请在 config.yaml 启用 enableServerPlugins 并重启酒馆';
+        : '未连接：请安装服务端插件，在 config.yaml 启用 enableServerPlugins 并重启酒馆';
 
     $p.html(`
         <div class="vb-row">

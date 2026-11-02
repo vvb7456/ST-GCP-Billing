@@ -1,0 +1,11 @@
+{
+    "display_name": "Agent Platform 费用统计",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "extension/index.js",
+    "css": "extension/style.css",
+    "author": "vvb7456",
+    "version": "1.2.0",
+    "homePage": "https://github.com/vvb7456/ST-GCP-Billing"
+}
