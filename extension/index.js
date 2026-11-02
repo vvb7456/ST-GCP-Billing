@@ -63,19 +63,20 @@ function compact(n) {
     return n.toLocaleString();
 }
 
-function usd(v) {
+function fmt4(v) {
     v = Number(v || 0);
-    if (v === 0) return '$0.00';
-    if (Math.abs(v) >= 1) return '$' + v.toFixed(2);
-    if (Math.abs(v) >= 0.01) return '$' + v.toFixed(4);
-    return '$' + v.toPrecision(3);
+    if (v > 0 && v < 0.0001) return '0.0001';
+    return v.toFixed(4);
+}
+
+function usd(v) {
+    return '$' + fmt4(v);
 }
 
 function converted(v) {
     const p = prefs();
     if (!(p.rate > 0)) return '';
-    const x = Number(v || 0) * p.rate;
-    return `≈ ${x >= 1 ? x.toFixed(2) : x.toFixed(4)} ${esc(p.currency)}`;
+    return `≈ ${fmt4(Number(v || 0) * p.rate)} ${esc(p.currency)}`;
 }
 
 function money(v) {
@@ -106,8 +107,8 @@ function periodSince(id) {
     return 0;
 }
 
-function billableInput(b) {
-    return Math.max(0, (b.promptTokens || 0) - (b.cachedTokens || 0)) + (b.toolUseTokens || 0);
+function inputTokens(b) {
+    return (b.promptTokens || 0) + (b.toolUseTokens || 0);
 }
 
 /* ---------- shell ---------- */
@@ -182,7 +183,7 @@ function recordItemHtml(r) {
     if (r.cost?.regional) badges.push(`<span class="vb-badge" title="区域端点，按区域价计费">${esc(r.location)}</span>`);
     if (r.grounded) badges.push('<span class="vb-badge" title="使用了联网搜索">联网</span>');
     if (r.trafficType && r.trafficType !== 'ON_DEMAND') badges.push(`<span class="vb-badge">${esc(r.trafficType)}</span>`);
-    const input = Math.max(0, (u.promptTokenCount || 0) - (u.cachedContentTokenCount || 0)) + (u.toolUsePromptTokenCount || 0);
+    const input = (u.promptTokenCount || 0) + (u.toolUsePromptTokenCount || 0);
     const costTitle = r.cost
         ? `输入 ${usd(r.cost.input)} · 缓存 ${usd(r.cost.cached)} · 输出 ${usd(r.cost.output)} · 思考 ${usd(r.cost.thoughts)}`
         : '该模型尚未定价';
@@ -197,8 +198,8 @@ function recordItemHtml(r) {
         <div class="vb-record-sub">
             <span title="${esc(new Date(r.ts).toLocaleString())}">${timeLabel(r.ts)}</span>
             <span class="vb-tokens">
-                <span title="未命中缓存的输入"><i class="fa-solid fa-arrow-right-to-bracket"></i>${fmt(input)}</span>
-                ${u.cachedContentTokenCount ? `<span title="缓存命中"><i class="fa-solid fa-bolt"></i>${fmt(u.cachedContentTokenCount)}</span>` : ''}
+                <span title="总输入（含缓存命中）"><i class="fa-solid fa-arrow-right-to-bracket"></i>${fmt(input)}</span>
+                ${u.cachedContentTokenCount ? `<span title="其中缓存命中"><i class="fa-solid fa-bolt"></i>${fmt(u.cachedContentTokenCount)}</span>` : ''}
                 <span title="输出"><i class="fa-solid fa-arrow-right-from-bracket"></i>${fmt(u.candidatesTokenCount)}</span>
                 ${u.thoughtsTokenCount ? `<span title="思考"><i class="fa-solid fa-brain"></i>${fmt(u.thoughtsTokenCount)}</span>` : ''}
             </span>
@@ -229,8 +230,8 @@ function renderOverview() {
             ${converted(b.cost) ? `<div class="vb-hero-converted">${converted(b.cost)}</div>` : ''}
             <div class="vb-hero-sub">${fmt(b.requests)} 次请求 · 共 ${compact(b.totalTokens)} Token</div>
             <div class="vb-stats">
-                <div class="vb-stat" title="未命中缓存的输入 Token（含工具调用上下文）"><div class="vb-stat-label">输入</div><div class="vb-stat-value">${compact(billableInput(b))}</div></div>
-                <div class="vb-stat" title="命中缓存、按缓存价计费的输入 Token"><div class="vb-stat-label">缓存命中</div><div class="vb-stat-value">${compact(b.cachedTokens)}</div></div>
+                <div class="vb-stat" title="总输入 Token（含缓存命中与工具调用上下文）"><div class="vb-stat-label">输入</div><div class="vb-stat-value">${compact(inputTokens(b))}</div></div>
+                <div class="vb-stat" title="输入中命中缓存、按缓存价计费的 Token"><div class="vb-stat-label">缓存命中</div><div class="vb-stat-value">${compact(b.cachedTokens)}</div></div>
                 <div class="vb-stat" title="模型正文输出 Token"><div class="vb-stat-label">输出</div><div class="vb-stat-value">${compact(b.outputTokens)}</div></div>
                 <div class="vb-stat" title="思考 Token，按输出价计费"><div class="vb-stat-label">思考</div><div class="vb-stat-value">${compact(b.thoughtsTokens)}</div></div>
             </div>
@@ -246,7 +247,7 @@ function renderOverview() {
                 <div class="vb-model-row-main">
                     <div class="vb-row-info">
                         <div class="vb-row-title">${esc(name)}</div>
-                        <div class="vb-row-desc">${fmt(m.requests)} 次 · 输入 ${compact(billableInput(m))} · 缓存 ${compact(m.cachedTokens)} · 输出 ${compact(m.outputTokens + m.thoughtsTokens)}</div>
+                        <div class="vb-row-desc">${fmt(m.requests)} 次 · 输入 ${compact(inputTokens(m))} · 缓存 ${compact(m.cachedTokens)} · 输出 ${compact(m.outputTokens + m.thoughtsTokens)}</div>
                     </div>
                     <div class="vb-model-cost">${m.unpriced === m.requests ? '<span class="vb-warn-text">未定价</span>' : money(m.cost)}</div>
                 </div>
