@@ -10,26 +10,40 @@ const LEDGER_FILE = path.join(DATA_DIR, 'ledger.jsonl');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
-    hostPattern: '(^|\\.)aiplatform\\.googleapis\\.com$',
     pricing: DEFAULT_PRICING,
 };
 
 let settings = structuredClone(DEFAULT_SETTINGS);
 let records = [];
-let hostRegex = new RegExp(DEFAULT_SETTINGS.hostPattern);
+// Extra hosts to treat as Agent Platform, only for pointing tests at a local mock server.
+const TEST_HOSTS = (process.env.AGENT_PLATFORM_BILLING_TEST_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
 const restoreFns = [];
 
 const VERTEX_PATH = /\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$|\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
 
+/** Express-mode URLs carry no /locations/ segment; the region is encoded in the hostname instead. */
+function locationFromHost(hostname) {
+    if (hostname === 'aiplatform.googleapis.com') return 'global';
+    const m = /^([a-z0-9-]+)-aiplatform\.googleapis\.com$/.exec(hostname);
+    return m ? m[1] : null;
+}
+
+/** Service endpoints ST can call: global `aiplatform.googleapis.com` and regional `{region}-aiplatform.googleapis.com`. */
+function isAgentPlatformHost(hostname) {
+    return hostname === 'aiplatform.googleapis.com'
+        || /^[a-z0-9-]+-aiplatform\.googleapis\.com$/.test(hostname)
+        || TEST_HOSTS.includes(hostname);
+}
+
 function matchVertex(urlString) {
     try {
         const url = new URL(urlString);
-        if (!hostRegex.test(url.hostname)) return null;
+        if (!isAgentPlatformHost(url.hostname)) return null;
         const m = VERTEX_PATH.exec(url.pathname);
         if (!m) return null;
         return m[1]
             ? { project: decodeURIComponent(m[1]), location: m[2], model: decodeURIComponent(m[3]), method: m[4] }
-            : { project: null, location: null, model: decodeURIComponent(m[5]), method: m[6] };
+            : { project: null, location: locationFromHost(url.hostname), model: decodeURIComponent(m[5]), method: m[6] };
     } catch {
         return null;
     }
@@ -42,24 +56,15 @@ function loadState() {
             const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
             settings = { ...structuredClone(DEFAULT_SETTINGS), ...saved };
         } catch (e) {
-            console.error('[vertex-billing] settings.json is corrupted, using defaults:', e.message);
+            console.error('[agent-platform-billing] settings.json is corrupted, using defaults:', e.message);
         }
     }
-    applyHostPattern();
     records = [];
     if (fs.existsSync(LEDGER_FILE)) {
         for (const line of fs.readFileSync(LEDGER_FILE, 'utf8').split('\n')) {
             if (!line.trim()) continue;
             try { records.push(JSON.parse(line)); } catch { /* skip torn line from a crash mid-write */ }
         }
-    }
-}
-
-function applyHostPattern() {
-    try {
-        hostRegex = new RegExp(settings.hostPattern || DEFAULT_SETTINGS.hostPattern);
-    } catch {
-        hostRegex = new RegExp(DEFAULT_SETTINGS.hostPattern);
     }
 }
 
@@ -75,7 +80,7 @@ function rewriteLedger() {
 
 function priceRecord(record) {
     const hit = findPrice(settings.pricing, record.model);
-    const cost = hit ? calculateCost(record.usage, hit.price) : null;
+    const cost = hit ? calculateCost(record.usage, hit.price, { ts: record.ts, location: record.location }) : null;
     record.priceKey = hit?.key ?? null;
     record.cost = cost;
     return record;
@@ -84,7 +89,7 @@ function priceRecord(record) {
 function record(info, payload) {
     const usage = payload.usage;
     if (!usage) {
-        console.warn(`[vertex-billing] ${info.model} ${info.method}: response has no usageMetadata (complete=${payload.complete})`);
+        console.warn(`[agent-platform-billing] ${info.model} ${info.method}: response has no usageMetadata (complete=${payload.complete})`);
     }
     const rec = priceRecord({
         id: crypto.randomUUID(),
@@ -105,10 +110,10 @@ function record(info, payload) {
     try {
         fs.appendFileSync(LEDGER_FILE, JSON.stringify(rec) + '\n');
     } catch (e) {
-        console.error('[vertex-billing] failed to append ledger:', e.message);
+        console.error('[agent-platform-billing] failed to append ledger:', e.message);
     }
     const c = rec.cost ? `$${rec.cost.total.toFixed(6)}` : '未定价';
-    console.info(`[vertex-billing] ${rec.model} in=${usage?.promptTokenCount ?? '-'} out=${usage?.candidatesTokenCount ?? '-'} think=${usage?.thoughtsTokenCount ?? 0} cached=${usage?.cachedContentTokenCount ?? 0} cost=${c}${rec.complete ? '' : ' (incomplete)'}`);
+    console.info(`[agent-platform-billing] ${rec.model} in=${usage?.promptTokenCount ?? '-'} out=${usage?.candidatesTokenCount ?? '-'} think=${usage?.thoughtsTokenCount ?? 0} cached=${usage?.cachedContentTokenCount ?? 0} cost=${c}${rec.complete ? '' : ' (incomplete)'}`);
 }
 
 /** Folds one GenerateContentResponse (or stream chunk) into the accumulator. Last usageMetadata wins: Vertex reports cumulative totals. */
@@ -156,7 +161,7 @@ function tapSseStream(stream, info) {
         drain(true);
         acc.complete = complete;
         if (acc.usage || complete) record(info, acc);
-        else console.warn(`[vertex-billing] ${info.model} stream closed before any usageMetadata arrived; Google may still bill this request`);
+        else console.warn(`[agent-platform-billing] ${info.model} stream closed before any usageMetadata arrived; Google may still bill this request`);
     };
 
     stream.on('data', (chunk) => {
@@ -193,7 +198,7 @@ async function installHooks() {
                     if (info && info.method === 'generateContent') record(info, parseNonStreamBody(result));
                 }
             } catch (e) {
-                console.error('[vertex-billing] failed to parse non-stream response:', e.message);
+                console.error('[agent-platform-billing] failed to parse non-stream response:', e.message);
             }
             return result;
         },
@@ -220,7 +225,7 @@ async function installHooks() {
                     }
                 }
             } catch (e) {
-                console.error('[vertex-billing] failed to tap stream:', e.message);
+                console.error('[agent-platform-billing] failed to tap stream:', e.message);
             }
             return stream;
         },
@@ -251,35 +256,41 @@ const emptyBucket = () => ({
     thoughtsTokens: 0, totalTokens: 0, cost: 0, unpriced: 0, incomplete: 0, grounded: 0,
 });
 
-function summarize(since) {
+function summarize(since, todaySince) {
     const total = emptyBucket();
     const period = emptyBucket();
+    const today = emptyBucket();
     const byModel = {};
+    const unpricedModels = new Set();
     for (const rec of records) {
         sumInto(total, rec);
-        (byModel[rec.model] ??= emptyBucket());
-        sumInto(byModel[rec.model], rec);
-        if (since && rec.ts >= since) sumInto(period, rec);
+        if (!rec.cost) unpricedModels.add(rec.model);
+        if (todaySince && rec.ts >= todaySince) sumInto(today, rec);
+        if (rec.ts >= since) {
+            sumInto(period, rec);
+            sumInto(byModel[rec.model] ??= emptyBucket(), rec);
+        }
     }
-    return { total, period, byModel, firstTs: records[0]?.ts ?? null };
+    return { total, period, today, byModel, unpricedModels: [...unpricedModels], firstTs: records[0]?.ts ?? null };
 }
 
 export const info = {
-    id: 'vertex-billing',
-    name: 'Vertex AI Billing',
-    description: 'Records exact Vertex AI token usage from upstream usageMetadata and computes cost.',
+    id: 'agent-platform-billing',
+    name: 'Agent Platform 费用统计',
+    description: 'Records exact Agent Platform (Vertex AI) token usage from upstream usageMetadata and computes cost.',
 };
 
 export async function init(router) {
     loadState();
     await installHooks();
-    console.info(`[vertex-billing] hooks installed, ${records.length} record(s) loaded`);
+    console.info(`[agent-platform-billing] hooks installed, ${records.length} record(s) loaded`);
 
     router.post('/summary', (req, res) => {
         const since = Number(req.body?.since) || 0;
+        const todaySince = Number(req.body?.todaySince) || 0;
         const after = Number(req.body?.afterTs) || 0;
         res.json({
-            ...summarize(since),
+            ...summarize(since, todaySince),
             latest: records.filter(r => r.ts > after).slice(-20),
             lastTs: records.at(-1)?.ts ?? 0,
         });
@@ -287,7 +298,7 @@ export async function init(router) {
 
     router.post('/records', (req, res) => {
         const limit = Math.min(Number(req.body?.limit) || 100, 1000);
-        res.json(records.slice(-limit).reverse());
+        res.json({ items: records.slice(-limit).reverse(), total: records.length });
     });
 
     router.post('/settings/get', (_req, res) => {
@@ -295,17 +306,12 @@ export async function init(router) {
     });
 
     router.post('/settings/save', (req, res) => {
-        const { pricing, hostPattern } = req.body || {};
+        const { pricing } = req.body || {};
         if (pricing !== undefined) {
             if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) {
                 return res.status(400).json({ error: 'pricing must be an object' });
             }
             settings.pricing = pricing;
-        }
-        if (hostPattern !== undefined) {
-            try { new RegExp(hostPattern); } catch { return res.status(400).json({ error: 'invalid hostPattern' }); }
-            settings.hostPattern = hostPattern;
-            applyHostPattern();
         }
         saveSettings();
         res.json({ ok: true });

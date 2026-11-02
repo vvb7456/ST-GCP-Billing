@@ -1,41 +1,52 @@
-// All prices are USD per 1M tokens. Defaults reflect Vertex AI public on-demand (Standard PayGo) list prices;
-// users must verify them against https://cloud.google.com/vertex-ai/generative-ai/pricing and edit in the UI.
+// USD per 1M tokens, Standard (on-demand) tier, taken from the official pricing page
+// https://cloud.google.com/vertex-ai/generative-ai/pricing (Agent Platform Pricing) as of 2026-11-02.
+// Base fields are Global-endpoint prices; `nonGlobal` overrides apply to regional endpoints.
+// Time-limited promotional prices are intentionally not modeled: list prices only.
 export const DEFAULT_PRICING = {
+    'gemini-4-argon': {
+        input: 4.0, cachedInput: 0.2, output: 20.0,
+        nonGlobal: { input: 4.4, cachedInput: 0.22, output: 22.0 },
+    },
+    'gemini-3.8-flash': {
+        input: 1.5, cachedInput: 0.15, output: 7.5,
+        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
+    },
+    'gemini-3.7-flash': {
+        input: 1.5, cachedInput: 0.15, output: 7.5,
+        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
+    },
+    'gemini-3.6-flash': {
+        input: 1.5, cachedInput: 0.15, output: 7.5,
+        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
+    },
+    'gemini-3.5-flash': {
+        input: 1.5, cachedInput: 0.15, output: 9.0,
+        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 9.9 },
+    },
+    'gemini-3.5-flash-lite': {
+        input: 0.3, cachedInput: 0.03, output: 2.5,
+        nonGlobal: { input: 0.33, cachedInput: 0.033, output: 2.75 },
+    },
     'gemini-3.1-pro': {
-        input: 2.0, output: 12.0, cachedInput: 0.2,
+        input: 2.0, cachedInput: 0.2, output: 12.0,
         longContextThreshold: 200000,
-        long: { input: 4.0, output: 18.0, cachedInput: 0.4 },
+        long: { input: 4.0, cachedInput: 0.4, output: 18.0 },
     },
-    'gemini-3-pro': {
-        input: 2.0, output: 12.0, cachedInput: 0.2,
-        longContextThreshold: 200000,
-        long: { input: 4.0, output: 18.0, cachedInput: 0.4 },
+    'gemini-3.1-flash-lite': {
+        input: 0.25, inputAudio: 0.5, cachedInput: 0.025, cachedInputAudio: 0.05, output: 1.5,
+        nonGlobal: { input: 0.275, inputAudio: 0.55, cachedInput: 0.0275, cachedInputAudio: 0.055, output: 1.65 },
     },
+    // The Standard table omits the output row for this model; 3.00 = Priority output (5.40) / 1.8 Priority multiplier.
     'gemini-3-flash': {
-        input: 0.5, inputAudio: 1.0, output: 3.0, cachedInput: 0.05, cachedInputAudio: 0.1,
-    },
-    'gemini-2.5-pro': {
-        input: 1.25, output: 10.0, cachedInput: 0.125,
-        longContextThreshold: 200000,
-        long: { input: 2.5, output: 15.0, cachedInput: 0.25 },
-    },
-    'gemini-2.5-flash': {
-        input: 0.3, inputAudio: 1.0, output: 2.5, cachedInput: 0.03, cachedInputAudio: 0.1,
-    },
-    'gemini-2.5-flash-lite': {
-        input: 0.1, inputAudio: 0.3, output: 0.4, cachedInput: 0.01, cachedInputAudio: 0.03,
-    },
-    'gemini-2.0-flash': {
-        input: 0.15, inputAudio: 1.0, output: 0.6, cachedInput: 0.0375,
-    },
-    'gemini-2.0-flash-lite': {
-        input: 0.075, output: 0.3,
+        input: 0.5, inputAudio: 1.0, cachedInput: 0.05, cachedInputAudio: 0.1, output: 3.0,
     },
 };
 
+export const RATE_FIELDS = ['input', 'inputAudio', 'cachedInput', 'cachedInputAudio', 'output', 'outputImage'];
+
 /**
  * Exact key wins; otherwise the longest key that is a prefix of the model id
- * (so "gemini-2.5-flash-lite-preview-09-2025" hits "gemini-2.5-flash-lite", not "gemini-2.5-flash").
+ * (so "gemini-3.5-flash-lite" hits its own entry, not "gemini-3.5-flash").
  */
 export function findPrice(pricing, model) {
     if (!model) return null;
@@ -50,6 +61,31 @@ export function findPrice(pricing, model) {
 function num(v) {
     const n = Number(v);
     return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function rates(o) {
+    const out = {};
+    for (const f of RATE_FIELDS) if (o && typeof o[f] === 'number') out[f] = o[f];
+    return out;
+}
+
+/**
+ * Flattens a price entry into the rates that apply to one request.
+ * Precedence (later wins): base → nonGlobal; `long` blocks follow the same order.
+ */
+export function resolveRates(price, { location = 'global' } = {}) {
+    const regional = !!location && location !== 'global';
+
+    const layers = [price];
+    if (regional) layers.push(price.nonGlobal);
+
+    const base = {};
+    const long = {};
+    for (const layer of layers) {
+        Object.assign(base, rates(layer));
+        Object.assign(long, rates(layer?.long));
+    }
+    return { base, long, regional: regional && !!price.nonGlobal };
 }
 
 /** Modality breakdown whose sum is reconciled to `total`; any unexplained remainder is treated as TEXT. */
@@ -67,13 +103,13 @@ function byModality(details, total) {
 }
 
 /**
- * Billing rules (Vertex AI):
+ * Billing rules (Agent Platform / Vertex AI):
  * - promptTokenCount includes cachedContentTokenCount; cached part is billed at the cached rate.
- * - toolUsePromptTokenCount (e.g. grounding / code execution context) is billed as input.
+ * - toolUsePromptTokenCount (e.g. code execution context) is billed as input.
  * - thoughtsTokenCount is billed at the output rate and is NOT included in candidatesTokenCount.
  * - Long-context tier is selected by prompt size and applies to both input and output.
  */
-export function calculateCost(usage, price) {
+export function calculateCost(usage, price, context = {}) {
     if (!usage || !price) return null;
 
     const prompt = num(usage.promptTokenCount);
@@ -82,8 +118,9 @@ export function calculateCost(usage, price) {
     const candidates = num(usage.candidatesTokenCount);
     const thoughts = num(usage.thoughtsTokenCount);
 
+    const resolved = resolveRates(price, context);
     const isLong = num(price.longContextThreshold) > 0 && prompt > num(price.longContextThreshold);
-    const r = isLong && price.long ? { ...price, ...price.long } : price;
+    const r = isLong ? { ...resolved.base, ...resolved.long } : resolved.base;
 
     const inputRate = (m) => (m === 'AUDIO' && r.inputAudio != null ? num(r.inputAudio) : num(r.input));
     const cachedRate = (m) => {
@@ -117,6 +154,7 @@ export function calculateCost(usage, price) {
     const M = 1_000_000;
     const result = {
         tier: isLong ? 'long' : 'standard',
+        regional: resolved.regional,
         input: inputCost / M,
         cached: cachedCost / M,
         output: outputCost / M,
@@ -125,4 +163,3 @@ export function calculateCost(usage, price) {
     result.total = result.input + result.cached + result.output + result.thoughts;
     return result;
 }
-
