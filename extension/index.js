@@ -1,6 +1,6 @@
 const API = '/api/plugins/agent-platform-billing';
 const MODULE = 'agent_platform_billing';
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const REPO_URL = 'https://github.com/vvb7456/ST-GCP-Billing';
 
 const TABS = [
@@ -481,6 +481,11 @@ function priceSummary(p) {
     return `${parts.join(' · ')} ${tags.join('')}`;
 }
 
+function hasPriceMatch(pricing, model) {
+    if (!pricing || !model) return false;
+    return Boolean(pricing[model] || Object.keys(pricing).some(k => model.startsWith(k)));
+}
+
 function renderPricing() {
     const $p = $root().find('[data-panel="pricing"]');
     if (state.connected === false) return $p.html(disconnectedHtml());
@@ -492,9 +497,13 @@ function renderPricing() {
 
     $p.html(`
         <div class="vb-row-desc vb-pricing-head">单位：美元 / 每百万 Token，均为官方标准价，限时优惠不计入。模型名按前缀匹配，例如 <code>gemini-4-neon</code> 也会匹配 <code>gemini-4-neon-cyber-permissive</code>，多个都能匹配时取最长的那个。默认价格取自 Google Cloud 官方价格页（${esc(updatedAt)}），官方调价时请自行修改。</div>
-        ${unpriced.map(m => `<div class="vb-alert vb-alert-warn" data-action="add-price" data-model="${esc(m)}">
-            <i class="fa-solid fa-tag"></i><span><b>${esc(m)}</b> 还没有价格</span><b>添加 ›</b>
-        </div>`).join('')}
+        ${unpriced.map(m => hasPriceMatch(pricing, m)
+            ? `<div class="vb-alert vb-alert-warn" data-action="recalc">
+                <i class="fa-solid fa-calculator"></i><span><b>${esc(m)}</b> 已有定价，但存在未计价的历史记录</span><b>重算历史 ›</b>
+            </div>`
+            : `<div class="vb-alert vb-alert-warn" data-action="add-price" data-model="${esc(m)}">
+                <i class="fa-solid fa-tag"></i><span><b>${esc(m)}</b> 还没有价格</span><b>添加 ›</b>
+            </div>`).join('')}
         <div class="vb-price-list">
             ${Object.entries(pricing).map(([key, p]) => `
                 <div class="vb-row vb-price-row" data-action="edit-price" data-key="${esc(key)}">

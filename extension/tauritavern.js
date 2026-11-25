@@ -6,6 +6,8 @@ import {
     parseTauriSseRaw,
     parseTauriNormalizedResponse,
     priceRecord,
+    syncNewDefaultPricing,
+    priceUnpricedRecords,
     createRecord,
     summarize,
 } from '../server/billing-core.js';
@@ -58,7 +60,10 @@ export async function createTauriTavernBackend({
         throw new Error('TauriTavern native APIs (llmApiLogs / extension.store) are unavailable');
     }
 
-    let settings = { pricing: structuredClone(DEFAULT_PRICING) };
+    let settings = {
+        pricing: structuredClone(DEFAULT_PRICING),
+        knownDefaultModels: Object.keys(DEFAULT_PRICING),
+    };
     let records = [];
     let lastLogId = null;
     const seen = new Set();
@@ -146,11 +151,21 @@ export async function createTauriTavernBackend({
             extensionStore.tryGetJson({ namespace: STORE_NAMESPACE, key: KEY_META }).catch(() => ({ found: false })),
         ]);
 
+        let settingsChanged = false;
         if (savedSettings?.found && savedSettings.value && typeof savedSettings.value === 'object') {
-            settings = { pricing: structuredClone(DEFAULT_PRICING), ...savedSettings.value };
+            settings = {
+                pricing: structuredClone(DEFAULT_PRICING),
+                ...savedSettings.value,
+            };
+            if (!Array.isArray(savedSettings.value.knownDefaultModels)) delete settings.knownDefaultModels;
+            settingsChanged = syncNewDefaultPricing(settings, DEFAULT_PRICING);
         }
+        if (settingsChanged) await saveSettings();
+
         if (savedLedger?.found && Array.isArray(savedLedger.value)) {
             records = savedLedger.value;
+            const repriced = priceUnpricedRecords(records, settings.pricing);
+            if (repriced > 0) await saveLedger();
         }
         if (savedMeta?.found && typeof savedMeta.value?.lastLogId === 'number') {
             lastLogId = savedMeta.value.lastLogId;

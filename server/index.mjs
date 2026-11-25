@@ -14,6 +14,8 @@ import {
     absorb,
     parseNonStreamBody,
     priceRecord,
+    syncNewDefaultPricing,
+    priceUnpricedRecords,
     createRecord,
     summarize,
 } from './billing-core.js';
@@ -25,6 +27,7 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
     pricing: DEFAULT_PRICING,
+    knownDefaultModels: Object.keys(DEFAULT_PRICING),
     stCompat: true,
 };
 
@@ -37,20 +40,30 @@ const generateContext = new AsyncLocalStorage();
 
 function loadState() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
+    let settingsChanged = false;
     if (fs.existsSync(SETTINGS_FILE)) {
         try {
             const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
             settings = { ...structuredClone(DEFAULT_SETTINGS), ...saved };
+            if (!Array.isArray(saved.knownDefaultModels)) delete settings.knownDefaultModels;
+            settingsChanged = syncNewDefaultPricing(settings, DEFAULT_PRICING);
         } catch (e) {
             console.error('[agent-platform-billing] settings.json is corrupted, using defaults:', e.message);
         }
     }
+    if (settingsChanged) saveSettings();
+
     records = [];
     if (fs.existsSync(LEDGER_FILE)) {
         for (const line of fs.readFileSync(LEDGER_FILE, 'utf8').split('\n')) {
             if (!line.trim()) continue;
             try { records.push(JSON.parse(line)); } catch { /* skip torn line from a crash mid-write */ }
         }
+    }
+    const repriced = priceUnpricedRecords(records, settings.pricing);
+    if (repriced > 0) {
+        rewriteLedger();
+        console.info(`[agent-platform-billing] auto-priced ${repriced} previously unpriced record(s)`);
     }
 }
 

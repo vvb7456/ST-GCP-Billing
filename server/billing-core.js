@@ -232,6 +232,45 @@ export function priceRecord(record, pricing) {
     return record;
 }
 
+/**
+ * Merges newly introduced built-in models from `defaultPricing` into a user's saved settings without
+ * overwriting customized prices or reviving built-in models the user previously deleted.
+ * Returns true if `settings` was mutated and should be persisted.
+ */
+export function syncNewDefaultPricing(settings, defaultPricing) {
+    settings.pricing ??= {};
+    const known = new Set(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []);
+    let changed = !Array.isArray(settings.knownDefaultModels);
+
+    for (const [key, price] of Object.entries(defaultPricing)) {
+        if (!known.has(key)) {
+            if (!(key in settings.pricing)) {
+                settings.pricing[key] = structuredClone(price);
+                changed = true;
+            }
+            known.add(key);
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        settings.knownDefaultModels = [...known];
+    }
+    return changed;
+}
+
+/** Prices only historical records that previously had no price (`!rec.cost`) when a price now exists. */
+export function priceUnpricedRecords(records, pricing) {
+    let updated = 0;
+    for (const rec of records) {
+        if (!rec.cost && rec.usage && findPrice(pricing, rec.model)) {
+            priceRecord(rec, pricing);
+            if (rec.cost) updated += 1;
+        }
+    }
+    return updated;
+}
+
 function randomId() {
     if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
