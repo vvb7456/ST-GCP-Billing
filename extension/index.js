@@ -1,6 +1,6 @@
 const API = '/api/plugins/agent-platform-billing';
 const MODULE = 'agent_platform_billing';
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 const REPO_URL = 'https://github.com/vvb7456/ST-GCP-Billing';
 
 const TABS = [
@@ -17,6 +17,14 @@ const PERIODS = [
     { id: 'all', label: '全部' },
 ];
 
+const DEFAULT_GEMINI_4_MODELS = [
+    'gemini-4-neon',
+    'gemini-4-hydrogen',
+    'gemini-4-carbon',
+    'gemini-4-argon',
+];
+const MULTI_REGION_SUGGESTIONS = ['us', 'eu'];
+
 const state = {
     tab: 'overview',
     period: 'today',
@@ -25,7 +33,20 @@ const state = {
     recordLimit: 30,
     lastSeenTs: null,
     connected: null,
+    tauriTavern: false,
+    initError: null,
 };
+
+let ttBackend = null;
+let vertexCompatReady = false;
+let vertexSyncing = false;
+
+function isTauriTavern() {
+    return Boolean(
+        window.__TAURITAVERN__?.api?.dev?.llmApiLogs
+        && window.__TAURITAVERN__?.api?.extension?.store,
+    );
+}
 
 const ctx = () => SillyTavern.getContext();
 const $root = () => $('#vb_root');
@@ -36,14 +57,178 @@ function prefs() {
     s[MODULE].toast ??= true;
     s[MODULE].rate ??= 0;
     s[MODULE].currency ??= 'CNY';
+    s[MODULE].stVertexModel ??= '';
     return s[MODULE];
+}
+
+function isStCompatEnabled() {
+    return !state.tauriTavern && state.settings?.stCompat !== false;
+}
+
+/**
+ * Injects missing Gemini 4 models into original SillyTavern's `#model_vertexai_select` and `us`/`eu` into
+ * `#vertexai_region_suggestions`. Deduplicates against both native ST options and third-party custom-model
+ * extensions (`Custom Models` optgroup) so users never see duplicate entries.
+ */
+function syncStVertexCompat() {
+    if (state.tauriTavern) return;
+    const sel = document.getElementById('model_vertexai_select');
+    const enabled = isStCompatEnabled();
+
+    const datalist = document.getElementById('vertexai_region_suggestions');
+    if (datalist) {
+        if (!enabled) {
+            datalist.querySelectorAll('option[data-vb-region="true"]').forEach(el => el.remove());
+        } else {
+            const existingRegions = new Set(
+                Array.from(datalist.options || datalist.querySelectorAll('option')).map(o => o.value),
+            );
+            const globalOpt = datalist.querySelector('option[value="global"]');
+            let anchor = globalOpt ? globalOpt.nextSibling : datalist.firstChild;
+            for (const region of MULTI_REGION_SUGGESTIONS) {
+                if (existingRegions.has(region)) continue;
+                const opt = document.createElement('option');
+                opt.value = region;
+                opt.textContent = region;
+                opt.dataset.vbRegion = 'true';
+                datalist.insertBefore(opt, anchor);
+                anchor = opt.nextSibling;
+            }
+        }
+    }
+
+    if (!sel) return;
+    const prevValue = sel.value;
+    const existingGroup = sel.querySelector('optgroup[data-vb-gemini4="true"]');
+
+    if (!enabled) {
+        if (existingGroup) {
+            vertexSyncing = true;
+            existingGroup.remove();
+            vertexSyncing = false;
+        }
+        return;
+    }
+
+    const models = Array.isArray(state.settings?.gemini4Models) && state.settings.gemini4Models.length
+        ? state.settings.gemini4Models
+        : DEFAULT_GEMINI_4_MODELS;
+
+    const existingModels = new Set();
+    for (const opt of sel.querySelectorAll('option')) {
+        if (opt.parentElement?.dataset?.vbGemini4 === 'true') continue;
+        existingModels.add(opt.value);
+    }
+
+    const missing = models.filter(m => !existingModels.has(m));
+    const currentInGroup = existingGroup
+        ? Array.from(existingGroup.querySelectorAll('option')).map(o => o.value)
+        : [];
+    if (missing.length === currentInGroup.length && missing.every((m, i) => m === currentInGroup[i])) {
+        return;
+    }
+
+    vertexSyncing = true;
+    try {
+        if (existingGroup) existingGroup.remove();
+        if (missing.length > 0) {
+            const grp = document.createElement('optgroup');
+            grp.label = 'Gemini 4';
+            grp.dataset.vbGemini4 = 'true';
+            for (const m of missing) {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                grp.appendChild(opt);
+            }
+            const customGroup = Array.from(sel.children).find(
+                el => el.tagName === 'OPTGROUP' && el.label === 'Custom Models',
+            );
+            sel.insertBefore(grp, customGroup ? customGroup.nextSibling : sel.firstChild);
+        }
+        if (prevValue && Array.from(sel.options).some(o => o.value === prevValue)) {
+            sel.value = prevValue;
+        }
+    } finally {
+        vertexSyncing = false;
+    }
+}
+
+function restoreSavedGemini4Model() {
+    if (!isStCompatEnabled()) return;
+    const saved = prefs().stVertexModel;
+    if (!saved) return;
+    const sel = document.getElementById('model_vertexai_select');
+    if (!sel) return;
+    const grp = sel.querySelector('optgroup[data-vb-gemini4="true"]');
+    const hasSavedInOurGroup = grp && Array.from(grp.querySelectorAll('option')).some(o => o.value === saved);
+    if (!hasSavedInOurGroup) return;
+
+    // Never override if a third-party Custom Models extension already restored its own selection.
+    const selectedOpt = sel.selectedOptions?.[0];
+    if (selectedOpt?.parentElement?.label === 'Custom Models') return;
+    if (sel.value === saved) return;
+
+    sel.value = saved;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function initStVertexCompat() {
+    if (state.tauriTavern || vertexCompatReady) return;
+    const sel = document.getElementById('model_vertexai_select');
+    if (!sel) return;
+    vertexCompatReady = true;
+
+    syncStVertexCompat();
+    restoreSavedGemini4Model();
+    // Re-sync after third-party extensions that initialize inside setTimeout(..., 0).
+    setTimeout(() => {
+        syncStVertexCompat();
+        restoreSavedGemini4Model();
+    }, 80);
+
+    // Use capture phase so third-party custom-model extensions calling stopImmediatePropagation() cannot block us.
+    sel.addEventListener('change', () => {
+        if (vertexSyncing) return;
+        const selectedOpt = sel.selectedOptions?.[0];
+        if (selectedOpt?.parentElement?.dataset?.vbGemini4 === 'true') {
+            if (prefs().stVertexModel !== sel.value) {
+                prefs().stVertexModel = sel.value;
+                savePrefs();
+            }
+        } else if (sel.value && prefs().stVertexModel) {
+            prefs().stVertexModel = '';
+            savePrefs();
+        }
+    }, true);
+
+    const observer = new MutationObserver(() => {
+        if (vertexSyncing) return;
+        syncStVertexCompat();
+    });
+    observer.observe(sel, { childList: true, subtree: true });
 }
 
 function savePrefs() {
     ctx().saveSettingsDebounced();
 }
 
+async function ensureBackend() {
+    if (!isTauriTavern()) return;
+    state.tauriTavern = true;
+    if (ttBackend) return;
+    const { createTauriTavernBackend } = await import('./tauritavern.js');
+    ttBackend = await createTauriTavernBackend({
+        onRecord: () => refresh({ toastNew: true }),
+    });
+    state.initError = null;
+}
+
 async function api(endpoint, body = {}) {
+    if (state.tauriTavern) {
+        if (!ttBackend) throw new Error(state.initError || 'TauriTavern 本地统计服务未就绪');
+        return ttBackend.handle(endpoint, body);
+    }
     const res = await fetch(API + endpoint, {
         method: 'POST',
         headers: ctx().getRequestHeaders(),
@@ -117,7 +302,7 @@ function shellHtml() {
     return `
 <div class="inline-drawer vb-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
-        <b>Agent Platform 费用统计</b>
+        <b>Agent Platform 助手</b>
         <span id="vb_header_today" class="vb-header-today"></span>
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
@@ -147,6 +332,14 @@ function renderTab(id) {
 }
 
 function disconnectedHtml() {
+    if (state.tauriTavern) {
+        return `<div class="vb-empty">
+            <i class="fa-solid fa-plug-circle-xmark vb-empty-icon vb-danger"></i>
+            <div class="vb-empty-title">TauriTavern 本地统计初始化失败</div>
+            <div class="vb-empty-desc">${esc(state.initError || '未能访问 TauriTavern 原生日志或扩展存储接口，请升级到较新版本的 TauriTavern 后重试。')}</div>
+            <div class="menu_button menu_button_icon vb-btn" data-action="retry"><i class="fa-solid fa-rotate"></i><span>重试</span></div>
+        </div>`;
+    }
     return `<div class="vb-empty">
         <i class="fa-solid fa-plug-circle-xmark vb-empty-icon vb-danger"></i>
         <div class="vb-empty-title">未连接到服务端插件</div>
@@ -295,8 +488,10 @@ function renderPricing() {
     const pricing = state.settings.pricing || {};
     const unpriced = state.summary?.unpricedModels || [];
 
+    const updatedAt = state.settings.pricingUpdatedAt || '2026-11-25';
+
     $p.html(`
-        <div class="vb-row-desc vb-pricing-head">单位：美元 / 每百万 Token，均为官方标准价，限时优惠不计入。模型名按前缀匹配，例如 <code>gemini-3.1-pro</code> 也会匹配 <code>gemini-3.1-pro-preview</code>，多个都能匹配时取最长的那个。默认价格取自 Google Cloud 官方价格页（2026-11-02），官方调价时请自行修改。</div>
+        <div class="vb-row-desc vb-pricing-head">单位：美元 / 每百万 Token，均为官方标准价，限时优惠不计入。模型名按前缀匹配，例如 <code>gemini-4-neon</code> 也会匹配 <code>gemini-4-neon-cyber-permissive</code>，多个都能匹配时取最长的那个。默认价格取自 Google Cloud 官方价格页（${esc(updatedAt)}），官方调价时请自行修改。</div>
         ${unpriced.map(m => `<div class="vb-alert vb-alert-warn" data-action="add-price" data-model="${esc(m)}">
             <i class="fa-solid fa-tag"></i><span><b>${esc(m)}</b> 还没有价格</span><b>添加 ›</b>
         </div>`).join('')}
@@ -465,14 +660,19 @@ function renderSettings() {
     const $p = $root().find('[data-panel="settings"]');
     const p = prefs();
     const s = state.summary;
-    const statusDesc = state.connected
-        ? `已连接 · 共 ${fmt(s?.total.requests)} 条记录${s?.firstTs ? ` · 统计起点 ${new Date(s.firstTs).toLocaleDateString()}` : ''}`
-        : '未连接：请安装服务端插件，在 config.yaml 启用 enableServerPlugins 并重启酒馆';
+    const statusTitle = state.tauriTavern ? '运行模式' : '服务端插件';
+    const statusDesc = state.tauriTavern
+        ? (state.connected
+            ? `TauriTavern · 共 ${fmt(s?.total.requests)} 条记录${s?.firstTs ? ` · 统计起点 ${new Date(s.firstTs).toLocaleDateString()}` : ''}`
+            : `初始化失败：${esc(state.initError || '无法访问 TauriTavern 原生接口')}`)
+        : (state.connected
+            ? `已连接 · 共 ${fmt(s?.total.requests)} 条记录${s?.firstTs ? ` · 统计起点 ${new Date(s.firstTs).toLocaleDateString()}` : ''}`
+            : '未连接：请安装服务端插件，在 config.yaml 启用 enableServerPlugins 并重启酒馆');
 
     $p.html(`
         <div class="vb-row">
             <div class="vb-row-info">
-                <div class="vb-row-title">服务端插件</div>
+                <div class="vb-row-title">${statusTitle}</div>
                 <div class="vb-row-desc">${statusDesc}</div>
             </div>
             <i class="fa-solid ${state.connected ? 'fa-circle-check vb-ok' : 'fa-circle-xmark vb-danger'} vb-status-icon"></i>
@@ -498,6 +698,16 @@ function renderSettings() {
             </div>
         </div>
 
+        ${!state.tauriTavern && state.connected ? `
+        <div class="vb-section-title">原版酒馆兼容</div>
+        <div class="vb-row">
+            <div class="vb-row-info">
+                <div class="vb-row-title">Gemini 4 与区域端点修复</div>
+                <div class="vb-row-desc">自动补齐 Vertex AI 的 Gemini 4 模型（自动避让自定义模型插件），启用思考开关/强度并修复非 global 及 us/eu 端点拼接</div>
+            </div>
+            ${switchHtml('vb_st_compat', state.settings?.stCompat !== false)}
+        </div>` : ''}
+
         <div class="vb-section-title">数据</div>
         <div class="vb-row">
             <div class="vb-row-info">
@@ -516,9 +726,9 @@ function renderSettings() {
 
         <div class="vb-about">
             <div class="vb-about-icon"><i class="fa-solid fa-receipt"></i></div>
-            <div class="vb-about-name">Agent Platform 费用统计</div>
+            <div class="vb-about-name">Agent Platform 助手</div>
             <div class="vb-about-version">Version ${VERSION}</div>
-            <div class="vb-about-desc">SillyTavern Agent Platform 实时用量与费用统计扩展</div>
+            <div class="vb-about-desc">SillyTavern / TauriTavern Agent Platform 用量计费与兼容增强扩展</div>
             <a href="${REPO_URL}" target="_blank" rel="noopener" class="vb-about-link">
                 <i class="fa-brands fa-github"></i>
                 <span>GitHub</span>
@@ -584,7 +794,12 @@ function bindEvents() {
 
     $r.on('click', '.vb-tab', function () { switchTab(this.dataset.tab); });
     $r.on('click', '[data-period]', function () { state.period = this.dataset.period; refresh(); });
-    $r.on('click', '[data-action="retry"]', async () => { await loadSettings(); refresh(); });
+    $r.on('click', '[data-action="retry"]', async () => {
+        try { await ensureBackend(); } catch (e) { state.initError = e.message; }
+        await loadSettings();
+        if (!state.tauriTavern) syncStVertexCompat();
+        refresh();
+    });
     $r.on('click', '[data-action="goto-pricing"]', () => switchTab('pricing'));
     $r.on('click', '[data-action="more"]', () => { state.recordLimit += 50; renderRecords(); });
 
@@ -611,6 +826,18 @@ function bindEvents() {
     $r.on('change', '#vb_toast', function () { prefs().toast = this.checked; savePrefs(); });
     $r.on('change', '#vb_rate', function () { prefs().rate = Number(this.value) || 0; savePrefs(); updateHeader(); });
     $r.on('change', '#vb_currency', function () { prefs().currency = this.value.trim() || 'CNY'; savePrefs(); });
+    $r.on('change', '#vb_st_compat', async function () {
+        const next = this.checked;
+        try {
+            await api('/settings/save', { stCompat: next });
+            if (state.settings) state.settings.stCompat = next;
+            syncStVertexCompat();
+            toastr.success(next ? '已开启原版酒馆 Gemini 4 与端点修复' : '已关闭原版酒馆 Gemini 4 与端点修复');
+        } catch (e) {
+            this.checked = !next;
+            toastr.error(e.message, '保存失败');
+        }
+    });
 
     $r.on('click', '[data-action="recalc"]', async () => {
         try {
@@ -635,15 +862,26 @@ jQuery(async () => {
     $('#extensions_settings2').append(shellHtml());
     bindEvents();
     switchTab('overview');
+
+    try {
+        await ensureBackend();
+    } catch (e) {
+        console.error('[agent-platform-billing] TauriTavern init failed:', e);
+        state.initError = e.message;
+    }
+
     await loadSettings();
+    if (!state.tauriTavern) initStVertexCompat();
     await refresh();
 
-    const { eventSource, eventTypes } = ctx();
-    const onGenerationDone = () => {
-        // Streamed responses are recorded when the upstream SSE ends, which can land slightly after the client finishes.
-        setTimeout(() => refresh({ toastNew: true }), 300);
-        setTimeout(() => refresh({ toastNew: true }), 2000);
-    };
-    eventSource.on(eventTypes.GENERATION_ENDED, onGenerationDone);
-    eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationDone);
+    if (!state.tauriTavern) {
+        const { eventSource, eventTypes } = ctx();
+        const onGenerationDone = () => {
+            // Streamed responses are recorded when the upstream SSE ends, which can land slightly after the client finishes.
+            setTimeout(() => refresh({ toastNew: true }), 300);
+            setTimeout(() => refresh({ toastNew: true }), 2000);
+        };
+        eventSource.on(eventTypes.GENERATION_ENDED, onGenerationDone);
+        eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationDone);
+    }
 });

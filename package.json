@@ -1,8 +1,9 @@
 {
     "name": "agent-platform-billing",
-    "version": "1.2.1",
+    "version": "1.3.0",
+    "type": "module",
     "private": true,
-    "description": "SillyTavern Agent Platform 实时用量与费用统计服务端插件",
+    "description": "SillyTavern Agent Platform 用量统计、Gemini 4 与区域端点兼容服务端插件",
     "main": "server/index.mjs",
     "license": "AGPL-3.0-or-later"
 }

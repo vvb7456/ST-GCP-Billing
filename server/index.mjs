@@ -1,8 +1,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_PRICING, findPrice, calculateCost } from './pricing.mjs';
+import { DEFAULT_PRICING, PRICING_UPDATED_AT } from './pricing.js';
+import {
+    GEMINI_4_MODELS,
+    isGemini4Model,
+    buildGemini4ThinkingConfig,
+    fixVertexUrl,
+    matchVertex,
+    absorb,
+    parseNonStreamBody,
+    priceRecord,
+    createRecord,
+    summarize,
+} from './billing-core.js';
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(PLUGIN_DIR, 'data');
@@ -11,6 +25,7 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
     pricing: DEFAULT_PRICING,
+    stCompat: true,
 };
 
 let settings = structuredClone(DEFAULT_SETTINGS);
@@ -18,36 +33,7 @@ let records = [];
 // Extra hosts to treat as Agent Platform, only for pointing tests at a local mock server.
 const TEST_HOSTS = (process.env.AGENT_PLATFORM_BILLING_TEST_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
 const restoreFns = [];
-
-const VERTEX_PATH = /\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$|\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
-
-/** Express-mode URLs carry no /locations/ segment; the region is encoded in the hostname instead. */
-function locationFromHost(hostname) {
-    if (hostname === 'aiplatform.googleapis.com') return 'global';
-    const m = /^([a-z0-9-]+)-aiplatform\.googleapis\.com$/.exec(hostname);
-    return m ? m[1] : null;
-}
-
-/** Service endpoints ST can call: global `aiplatform.googleapis.com` and regional `{region}-aiplatform.googleapis.com`. */
-function isAgentPlatformHost(hostname) {
-    return hostname === 'aiplatform.googleapis.com'
-        || /^[a-z0-9-]+-aiplatform\.googleapis\.com$/.test(hostname)
-        || TEST_HOSTS.includes(hostname);
-}
-
-function matchVertex(urlString) {
-    try {
-        const url = new URL(urlString);
-        if (!isAgentPlatformHost(url.hostname)) return null;
-        const m = VERTEX_PATH.exec(url.pathname);
-        if (!m) return null;
-        return m[1]
-            ? { project: decodeURIComponent(m[1]), location: m[2], model: decodeURIComponent(m[3]), method: m[4] }
-            : { project: null, location: locationFromHost(url.hostname), model: decodeURIComponent(m[5]), method: m[6] };
-    } catch {
-        return null;
-    }
-}
+const generateContext = new AsyncLocalStorage();
 
 function loadState() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -78,34 +64,12 @@ function rewriteLedger() {
     fs.renameSync(tmp, LEDGER_FILE);
 }
 
-function priceRecord(record) {
-    const hit = findPrice(settings.pricing, record.model);
-    const cost = hit ? calculateCost(record.usage, hit.price, { ts: record.ts, location: record.location }) : null;
-    record.priceKey = hit?.key ?? null;
-    record.cost = cost;
-    return record;
-}
-
 function record(info, payload) {
     const usage = payload.usage;
     if (!usage) {
         console.warn(`[agent-platform-billing] ${info.model} ${info.method}: response has no usageMetadata (complete=${payload.complete})`);
     }
-    const rec = priceRecord({
-        id: crypto.randomUUID(),
-        ts: Date.now(),
-        model: info.model,
-        modelVersion: payload.modelVersion ?? null,
-        project: info.project,
-        location: info.location,
-        stream: info.method === 'streamGenerateContent',
-        complete: payload.complete,
-        responseId: payload.responseId ?? null,
-        trafficType: usage?.trafficType ?? null,
-        grounded: payload.grounded || false,
-        searchQueries: payload.searchQueries || 0,
-        usage: usage ?? null,
-    });
+    const rec = createRecord(info, payload, settings.pricing);
     records.push(rec);
     try {
         fs.appendFileSync(LEDGER_FILE, JSON.stringify(rec) + '\n');
@@ -114,28 +78,6 @@ function record(info, payload) {
     }
     const c = rec.cost ? `$${rec.cost.total.toFixed(6)}` : '未定价';
     console.info(`[agent-platform-billing] ${rec.model} in=${usage?.promptTokenCount ?? '-'} out=${usage?.candidatesTokenCount ?? '-'} think=${usage?.thoughtsTokenCount ?? 0} cached=${usage?.cachedContentTokenCount ?? 0} cost=${c}${rec.complete ? '' : ' (incomplete)'}`);
-}
-
-/** Folds one GenerateContentResponse (or stream chunk) into the accumulator. Last usageMetadata wins: Vertex reports cumulative totals. */
-function absorb(acc, obj) {
-    if (!obj || typeof obj !== 'object') return;
-    if (obj.usageMetadata) acc.usage = obj.usageMetadata;
-    if (obj.modelVersion) acc.modelVersion = obj.modelVersion;
-    if (obj.responseId) acc.responseId = obj.responseId;
-    for (const c of Array.isArray(obj.candidates) ? obj.candidates : []) {
-        const g = c?.groundingMetadata;
-        if (g) {
-            acc.grounded = true;
-            if (Array.isArray(g.webSearchQueries)) acc.searchQueries = Math.max(acc.searchQueries || 0, g.webSearchQueries.length);
-        }
-    }
-}
-
-function parseNonStreamBody(text) {
-    const acc = { complete: true };
-    const parsed = JSON.parse(text);
-    for (const obj of Array.isArray(parsed) ? parsed : [parsed]) absorb(acc, obj);
-    return acc;
 }
 
 function tapSseStream(stream, info) {
@@ -173,6 +115,131 @@ function tapSseStream(stream, info) {
     stream.on('close', () => finish(false));
 }
 
+function effectiveVertexInfo(urlString) {
+    const targetUrl = settings.stCompat !== false ? fixVertexUrl(urlString).url : urlString;
+    return matchVertex(targetUrl, TEST_HOSTS);
+}
+
+/**
+ * Buffers an outgoing Gemini 4 JSON POST request and injects `generationConfig.thinkingConfig`
+ * only when upstream SillyTavern has not already set it.
+ */
+function patchGemini4ClientRequest(clientReq, model, ctx) {
+    const origWrite = clientReq.write;
+    const origEnd = clientReq.end;
+    const chunks = [];
+
+    const pushChunk = (chunk, encoding) => {
+        if (chunk == null) return;
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : 'utf8'));
+    };
+
+    clientReq.write = function patchedWrite(chunk, encoding, cb) {
+        if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+        pushChunk(chunk, encoding);
+        if (typeof cb === 'function') process.nextTick(cb);
+        return true;
+    };
+
+    clientReq.end = function patchedEnd(chunk, encoding, cb) {
+        if (typeof chunk === 'function') { cb = chunk; chunk = undefined; encoding = undefined; }
+        else if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+        pushChunk(chunk, encoding);
+
+        const rawBuf = Buffer.concat(chunks);
+        let outBuf = rawBuf;
+        try {
+            const parsed = JSON.parse(rawBuf.toString('utf8'));
+            if (parsed && typeof parsed === 'object' && !parsed.generationConfig?.thinkingConfig) {
+                parsed.generationConfig = {
+                    ...(parsed.generationConfig || {}),
+                    thinkingConfig: buildGemini4ThinkingConfig(model, ctx),
+                };
+                outBuf = Buffer.from(JSON.stringify(parsed), 'utf8');
+                clientReq.setHeader('Content-Length', outBuf.length);
+            }
+        } catch (e) {
+            console.error('[agent-platform-billing] failed to inject Gemini 4 thinkingConfig:', e.message);
+        }
+
+        clientReq.write = origWrite;
+        clientReq.end = origEnd;
+        return origEnd.call(this, outBuf, cb);
+    };
+}
+
+function stripHostHeader(options) {
+    if (!options || typeof options !== 'object' || !options.headers || typeof options.headers !== 'object') return options;
+    const nextHeaders = {};
+    let stripped = false;
+    for (const [k, v] of Object.entries(options.headers)) {
+        if (k.toLowerCase() === 'host') { stripped = true; continue; }
+        nextHeaders[k] = v;
+    }
+    return stripped ? { ...options, headers: nextHeaders } : options;
+}
+
+/**
+ * Installs SillyTavern compatibility hooks for Vertex AI without touching ST's source files:
+ * 1. Captures incoming `include_reasoning` and `reasoning_effort` per-request via AsyncLocalStorage.
+ * 2. Rewrites broken non-global / multi-region (`us`/`eu`) / Express Vertex AI hostnames on outbound requests.
+ * 3. Injects `thinkingConfig` for Gemini 4 models when ST omits it (auto-yields if upstream ST adds support).
+ */
+function installCompatHooks(router) {
+    const routerProto = Object.getPrototypeOf(router);
+    if (routerProto && typeof routerProto.handle === 'function') {
+        const origHandle = routerProto.handle;
+        routerProto.handle = function patchedRouterHandle(req, res, out) {
+            if (
+                settings.stCompat !== false
+                && !generateContext.getStore()
+                && req?.method === 'POST'
+                && req?.body?.chat_completion_source === 'vertexai'
+                && typeof req.originalUrl === 'string'
+                && req.originalUrl.split('?')[0].endsWith('/api/backends/chat-completions/generate')
+            ) {
+                const store = {
+                    model: req.body.model,
+                    includeReasoning: Boolean(req.body.include_reasoning),
+                    reasoningEffort: req.body.reasoning_effort,
+                };
+                return generateContext.run(store, () => origHandle.call(this, req, res, out));
+            }
+            return origHandle.call(this, req, res, out);
+        };
+        restoreFns.push(() => { routerProto.handle = origHandle; });
+    }
+
+    const wrapTransport = (mod) => {
+        const origRequest = mod.request;
+        mod.request = function patchedRequest(...args) {
+            if (settings.stCompat !== false && (typeof args[0] === 'string' || args[0] instanceof URL)) {
+                let urlStr = String(args[0]);
+                const fixed = fixVertexUrl(urlStr);
+                if (fixed.changed) {
+                    urlStr = fixed.url;
+                    args[0] = args[0] instanceof URL ? new URL(fixed.url) : fixed.url;
+                    if (args[1] && typeof args[1] === 'object') args[1] = stripHostHeader(args[1]);
+                    console.info(`[agent-platform-billing] fixed Vertex endpoint: ${fixed.from} -> ${fixed.to}`);
+                }
+
+                const ctx = generateContext.getStore();
+                const info = ctx ? matchVertex(urlStr, TEST_HOSTS) : null;
+                if (ctx && info && isGemini4Model(info.model)) {
+                    const clientReq = origRequest.apply(this, args);
+                    patchGemini4ClientRequest(clientReq, info.model, ctx);
+                    return clientReq;
+                }
+            }
+            return origRequest.apply(this, args);
+        };
+        restoreFns.push(() => { mod.request = origRequest; });
+    };
+
+    wrapTransport(https);
+    wrapTransport(http);
+}
+
 /**
  * ST's backend calls Vertex via node-fetch and, for non-stream requests, discards usageMetadata before replying
  * to the browser. Wrapping node-fetch's Response at the prototype level observes the raw upstream payload
@@ -194,7 +261,7 @@ async function installHooks() {
             const result = await origText.call(this);
             try {
                 if (this.ok) {
-                    const info = matchVertex(this.url);
+                    const info = effectiveVertexInfo(this.url);
                     if (info && info.method === 'generateContent') record(info, parseNonStreamBody(result));
                 }
             } catch (e) {
@@ -218,7 +285,7 @@ async function installHooks() {
             const stream = bodyDesc.get.call(this);
             try {
                 if (stream && this.ok && !tapped.has(stream) && typeof stream.on === 'function') {
-                    const info = matchVertex(this.url);
+                    const info = effectiveVertexInfo(this.url);
                     if (info && info.method === 'streamGenerateContent') {
                         tapped.add(stream);
                         tapSseStream(stream, info);
@@ -236,52 +303,15 @@ async function installHooks() {
     });
 }
 
-function sumInto(bucket, rec) {
-    const u = rec.usage || {};
-    bucket.requests += 1;
-    bucket.promptTokens += u.promptTokenCount || 0;
-    bucket.cachedTokens += u.cachedContentTokenCount || 0;
-    bucket.toolUseTokens += u.toolUsePromptTokenCount || 0;
-    bucket.outputTokens += u.candidatesTokenCount || 0;
-    bucket.thoughtsTokens += u.thoughtsTokenCount || 0;
-    bucket.totalTokens += u.totalTokenCount || 0;
-    if (rec.cost) bucket.cost += rec.cost.total;
-    else bucket.unpriced += 1;
-    if (!rec.complete) bucket.incomplete += 1;
-    if (rec.grounded) bucket.grounded += 1;
-}
-
-const emptyBucket = () => ({
-    requests: 0, promptTokens: 0, cachedTokens: 0, toolUseTokens: 0, outputTokens: 0,
-    thoughtsTokens: 0, totalTokens: 0, cost: 0, unpriced: 0, incomplete: 0, grounded: 0,
-});
-
-function summarize(since, todaySince) {
-    const total = emptyBucket();
-    const period = emptyBucket();
-    const today = emptyBucket();
-    const byModel = {};
-    const unpricedModels = new Set();
-    for (const rec of records) {
-        sumInto(total, rec);
-        if (!rec.cost) unpricedModels.add(rec.model);
-        if (todaySince && rec.ts >= todaySince) sumInto(today, rec);
-        if (rec.ts >= since) {
-            sumInto(period, rec);
-            sumInto(byModel[rec.model] ??= emptyBucket(), rec);
-        }
-    }
-    return { total, period, today, byModel, unpricedModels: [...unpricedModels], firstTs: records[0]?.ts ?? null };
-}
-
 export const info = {
     id: 'agent-platform-billing',
-    name: 'Agent Platform 费用统计',
-    description: 'SillyTavern Agent Platform 实时用量与费用统计服务端插件',
+    name: 'Agent Platform 助手',
+    description: 'SillyTavern Agent Platform 用量统计、Gemini 4 与区域端点兼容服务端插件',
 };
 
 export async function init(router) {
     loadState();
+    installCompatHooks(router);
     await installHooks();
     console.info(`[agent-platform-billing] hooks installed, ${records.length} record(s) loaded`);
 
@@ -289,7 +319,7 @@ export async function init(router) {
         const since = Number(req.body?.since) || 0;
         const todaySince = Number(req.body?.todaySince) || 0;
         res.json({
-            ...summarize(since, todaySince),
+            ...summarize(records, since, todaySince),
             latest: records.slice(-20),
             lastTs: records.at(-1)?.ts ?? 0,
         });
@@ -301,23 +331,31 @@ export async function init(router) {
     });
 
     router.post('/settings/get', (_req, res) => {
-        res.json({ ...settings, defaultPricing: DEFAULT_PRICING });
+        res.json({
+            ...settings,
+            defaultPricing: DEFAULT_PRICING,
+            pricingUpdatedAt: PRICING_UPDATED_AT,
+            gemini4Models: GEMINI_4_MODELS,
+        });
     });
 
     router.post('/settings/save', (req, res) => {
-        const { pricing } = req.body || {};
+        const { pricing, stCompat } = req.body || {};
         if (pricing !== undefined) {
             if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) {
                 return res.status(400).json({ error: 'pricing must be an object' });
             }
             settings.pricing = pricing;
         }
+        if (stCompat !== undefined) {
+            settings.stCompat = Boolean(stCompat);
+        }
         saveSettings();
         res.json({ ok: true });
     });
 
     router.post('/recalculate', (_req, res) => {
-        records.forEach(priceRecord);
+        records.forEach(r => priceRecord(r, settings.pricing));
         rewriteLedger();
         res.json({ ok: true, count: records.length });
     });
@@ -332,4 +370,3 @@ export async function init(router) {
 export async function exit() {
     while (restoreFns.length) restoreFns.pop()();
 }
-
