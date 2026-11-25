@@ -1,6 +1,6 @@
 const API = '/api/plugins/agent-platform-billing';
 const MODULE = 'agent_platform_billing';
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const REPO_URL = 'https://github.com/vvb7456/ST-GCP-Billing';
 
 const TABS = [
@@ -17,12 +17,6 @@ const PERIODS = [
     { id: 'all', label: '全部' },
 ];
 
-const DEFAULT_GEMINI_4_MODELS = [
-    'gemini-4-neon',
-    'gemini-4-hydrogen',
-    'gemini-4-carbon',
-    'gemini-4-argon',
-];
 const MULTI_REGION_SUGGESTIONS = ['us', 'eu'];
 
 const state = {
@@ -66,7 +60,7 @@ function isStCompatEnabled() {
 }
 
 /**
- * Injects missing Gemini 4 models into original SillyTavern's `#model_vertexai_select` and `us`/`eu` into
+ * Injects missing Gemini 4 / 3.8 models into original SillyTavern's `#model_vertexai_select` and `us`/`eu` into
  * `#vertexai_region_suggestions`. Deduplicates against both native ST options and third-party custom-model
  * extensions (`Custom Models` optgroup) so users never see duplicate entries.
  */
@@ -99,52 +93,55 @@ function syncStVertexCompat() {
 
     if (!sel) return;
     const prevValue = sel.value;
-    const existingGroup = sel.querySelector('optgroup[data-vb-gemini4="true"]');
+    const existingGroups = Array.from(sel.querySelectorAll('optgroup[data-vb-compat="true"]'));
 
     if (!enabled) {
-        if (existingGroup) {
+        if (existingGroups.length) {
             vertexSyncing = true;
-            existingGroup.remove();
+            existingGroups.forEach(g => g.remove());
             vertexSyncing = false;
         }
         return;
     }
 
-    const models = Array.isArray(state.settings?.gemini4Models) && state.settings.gemini4Models.length
-        ? state.settings.gemini4Models
-        : DEFAULT_GEMINI_4_MODELS;
+    const groups = Array.isArray(state.settings?.vertexCompatModelGroups)
+        ? state.settings.vertexCompatModelGroups
+        : [];
 
     const existingModels = new Set();
     for (const opt of sel.querySelectorAll('option')) {
-        if (opt.parentElement?.dataset?.vbGemini4 === 'true') continue;
+        if (opt.parentElement?.dataset?.vbCompat === 'true') continue;
         existingModels.add(opt.value);
     }
 
-    const missing = models.filter(m => !existingModels.has(m));
-    const currentInGroup = existingGroup
-        ? Array.from(existingGroup.querySelectorAll('option')).map(o => o.value)
-        : [];
-    if (missing.length === currentInGroup.length && missing.every((m, i) => m === currentInGroup[i])) {
-        return;
-    }
+    const desired = groups
+        .map(g => ({ label: g.label, models: (g.models || []).filter(m => !existingModels.has(m)) }))
+        .filter(g => g.models.length > 0);
+
+    const currentSig = JSON.stringify(existingGroups.map(g => ({
+        label: g.label,
+        models: Array.from(g.querySelectorAll('option')).map(o => o.value),
+    })));
+    if (currentSig === JSON.stringify(desired)) return;
 
     vertexSyncing = true;
     try {
-        if (existingGroup) existingGroup.remove();
-        if (missing.length > 0) {
+        existingGroups.forEach(g => g.remove());
+        const customGroup = Array.from(sel.children).find(
+            el => el.tagName === 'OPTGROUP' && el.label === 'Custom Models',
+        );
+        let anchor = customGroup ? customGroup.nextSibling : sel.firstChild;
+        for (const g of desired) {
             const grp = document.createElement('optgroup');
-            grp.label = 'Gemini 4';
-            grp.dataset.vbGemini4 = 'true';
-            for (const m of missing) {
+            grp.label = g.label;
+            grp.dataset.vbCompat = 'true';
+            for (const m of g.models) {
                 const opt = document.createElement('option');
                 opt.value = m;
                 opt.textContent = m;
                 grp.appendChild(opt);
             }
-            const customGroup = Array.from(sel.children).find(
-                el => el.tagName === 'OPTGROUP' && el.label === 'Custom Models',
-            );
-            sel.insertBefore(grp, customGroup ? customGroup.nextSibling : sel.firstChild);
+            sel.insertBefore(grp, anchor);
         }
         if (prevValue && Array.from(sel.options).some(o => o.value === prevValue)) {
             sel.value = prevValue;
@@ -160,8 +157,8 @@ function restoreSavedGemini4Model() {
     if (!saved) return;
     const sel = document.getElementById('model_vertexai_select');
     if (!sel) return;
-    const grp = sel.querySelector('optgroup[data-vb-gemini4="true"]');
-    const hasSavedInOurGroup = grp && Array.from(grp.querySelectorAll('option')).some(o => o.value === saved);
+    const hasSavedInOurGroup = Array.from(sel.querySelectorAll('optgroup[data-vb-compat="true"] option'))
+        .some(o => o.value === saved);
     if (!hasSavedInOurGroup) return;
 
     // Never override if a third-party Custom Models extension already restored its own selection.
@@ -191,7 +188,7 @@ function initStVertexCompat() {
     sel.addEventListener('change', () => {
         if (vertexSyncing) return;
         const selectedOpt = sel.selectedOptions?.[0];
-        if (selectedOpt?.parentElement?.dataset?.vbGemini4 === 'true') {
+        if (selectedOpt?.parentElement?.dataset?.vbCompat === 'true') {
             if (prefs().stVertexModel !== sel.value) {
                 prefs().stVertexModel = sel.value;
                 savePrefs();
@@ -220,6 +217,10 @@ async function ensureBackend() {
     const { createTauriTavernBackend } = await import('./tauritavern.js');
     ttBackend = await createTauriTavernBackend({
         onRecord: () => refresh({ toastNew: true }),
+        onCatalogUpdated: async () => {
+            await loadSettings();
+            await refresh();
+        },
     });
     state.initError = null;
 }
@@ -493,10 +494,13 @@ function renderPricing() {
     const pricing = state.settings.pricing || {};
     const unpriced = state.summary?.unpricedModels || [];
 
-    const updatedAt = state.settings.pricingUpdatedAt || '2026-11-25';
+    const syncedAt = state.settings.catalogSyncedAt;
+    const sourceDesc = syncedAt
+        ? `数据来源：<a href="https://models.dev" target="_blank" rel="noopener">models.dev</a>（上次同步：${esc(timeLabel(syncedAt))}，非 global 区域价按正式版 +10% 推算）。`
+        : `尚未从 <a href="https://models.dev" target="_blank" rel="noopener">models.dev</a> 拉取清单，请检查网络后点击下方“同步最新清单”。`;
 
     $p.html(`
-        <div class="vb-row-desc vb-pricing-head">单位：美元 / 每百万 Token，均为官方标准价，限时优惠不计入。模型名按前缀匹配，例如 <code>gemini-4-neon</code> 也会匹配 <code>gemini-4-neon-cyber-permissive</code>，多个都能匹配时取最长的那个。默认价格取自 Google Cloud 官方价格页（${esc(updatedAt)}），官方调价时请自行修改。</div>
+        <div class="vb-row-desc vb-pricing-head">单位：美元 / 每百万 Token。模型名按前缀匹配，多个匹配时取最长。${sourceDesc}自定义修改与删除会持久保留，不会被同步覆盖。</div>
         ${unpriced.map(m => hasPriceMatch(pricing, m)
             ? `<div class="vb-alert vb-alert-warn" data-action="recalc">
                 <i class="fa-solid fa-calculator"></i><span><b>${esc(m)}</b> 已有定价，但存在未计价的历史记录</span><b>重算历史 ›</b>
@@ -519,7 +523,8 @@ function renderPricing() {
         </div>
         <div class="vb-btn-row">
             <div class="menu_button menu_button_icon vb-btn" data-action="add-price"><i class="fa-solid fa-plus"></i><span>添加模型</span></div>
-            <div class="menu_button menu_button_icon vb-btn" data-action="restore-defaults"><i class="fa-solid fa-clock-rotate-left"></i><span>恢复默认价格</span></div>
+            <div class="menu_button menu_button_icon vb-btn" data-action="sync-catalog"><i class="fa-solid fa-cloud-arrow-down"></i><span>同步最新清单</span></div>
+            <div class="menu_button menu_button_icon vb-btn" data-action="restore-defaults"><i class="fa-solid fa-clock-rotate-left"></i><span>恢复默认</span></div>
         </div>
     `);
 }
@@ -711,8 +716,8 @@ function renderSettings() {
         <div class="vb-section-title">原版酒馆兼容</div>
         <div class="vb-row">
             <div class="vb-row-info">
-                <div class="vb-row-title">Gemini 4 与区域端点修复</div>
-                <div class="vb-row-desc">自动补齐 Vertex AI 的 Gemini 4 模型（自动避让自定义模型插件），启用思考开关/强度并修复非 global 及 us/eu 端点拼接</div>
+                <div class="vb-row-title">Vertex 模型与端点兼容</div>
+                <div class="vb-row-desc">补齐新版 Gemini 模型列表、修复思考开关与区域端点</div>
             </div>
             ${switchHtml('vb_st_compat', state.settings?.stCompat !== false)}
         </div>` : ''}
@@ -826,10 +831,35 @@ function bindEvents() {
         delete next[key];
         await savePricing(next, `已删除 ${key} 的定价`);
     });
+    $r.on('click', '[data-action="sync-catalog"]', async function () {
+        const $btn = $(this);
+        if ($btn.data('busy')) return;
+        $btn.data('busy', true).find('i').addClass('fa-spin');
+        try {
+            const res = await api('/catalog/sync');
+            await loadSettings();
+            if (!state.tauriTavern) syncStVertexCompat();
+            await refresh();
+            const parts = [];
+            if (res.added) parts.push(`新增 ${res.added} 个`);
+            if (res.updated) parts.push(`更新 ${res.updated} 个`);
+            if (res.repriced) parts.push(`补算 ${res.repriced} 条历史`);
+            toastr.success(parts.length ? `已从 ${res.source} 同步：${parts.join('，')}` : `已是最新（共 ${res.modelCount} 个模型）`);
+        } catch (e) {
+            toastr.error(e.message, '同步失败');
+        } finally {
+            $btn.data('busy', false).find('i').removeClass('fa-spin');
+        }
+    });
     $r.on('click', '[data-action="restore-defaults"]', async () => {
+        const defaults = state.settings?.defaultPricing || {};
+        if (!Object.keys(defaults).length) {
+            toastr.warning('尚未拉取到上游清单，请先点击“同步最新清单”');
+            return;
+        }
         const { Popup, POPUP_RESULT } = ctx();
-        if (await Popup.show.confirm('恢复默认价格？', '你自定义的价格会被替换为插件内置的默认价格。') !== POPUP_RESULT.AFFIRMATIVE) return;
-        await savePricing(structuredClone(state.settings.defaultPricing), '已恢复默认价格');
+        if (await Popup.show.confirm('恢复上游默认价格？', '你自定义的价格会被替换为最近一次从 models.dev 同步的价格。') !== POPUP_RESULT.AFFIRMATIVE) return;
+        await savePricing(structuredClone(defaults), '已恢复上游默认价格');
     });
 
     $r.on('change', '#vb_toast', function () { prefs().toast = this.checked; savePrefs(); });
@@ -841,7 +871,7 @@ function bindEvents() {
             await api('/settings/save', { stCompat: next });
             if (state.settings) state.settings.stCompat = next;
             syncStVertexCompat();
-            toastr.success(next ? '已开启原版酒馆 Gemini 4 与端点修复' : '已关闭原版酒馆 Gemini 4 与端点修复');
+            toastr.success(next ? '已开启 Vertex 模型与端点兼容' : '已关闭 Vertex 模型与端点兼容');
         } catch (e) {
             this.checked = !next;
             toastr.error(e.message, '保存失败');

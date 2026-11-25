@@ -76,20 +76,23 @@ enableServerPlugins: true
   - 流式：酒馆读取 `response.body` 时，如果地址是 Vertex `:streamGenerateContent`，在同一个流上额外监听数据，取最后一个 `usageMetadata`。
   返回给酒馆的数据原样不变。图片描述等其它走 Vertex `generateContent` 的调用同样会被记录。
 - **原版 SillyTavern 额外兼容（可在“设置”页开关，默认开启）**：
-  - 自动在 Vertex AI 模型下拉框中补齐缺失的 Gemini 4 系列模型（`gemini-4-neon` / `gemini-4-hydrogen` / `gemini-4-carbon` / `gemini-4-argon`），并与第三方自定义模型扩展自动去重、互不冲突；
+  - 自动在 Vertex AI 模型下拉框中补齐缺失的 Gemini 4 与 Gemini 3.8 模型（`gemini-4-neon` / `gemini-4-hydrogen` / `gemini-4-carbon` / `gemini-4-argon` / `gemini-3.8-flash`），并与第三方自定义模型扩展自动去重、互不冲突；
   - 自动为 Gemini 4 请求补全 `thinkingConfig`（同步“显示思考”开关与思考强度映射到 `low`/`medium`/`high`/`xhigh`，未来酒馆上游原生支持时自动让路）；
   - 自动修复原版酒馆拼接 Vertex AI 非 `global` 区域端点、Express 无项目号/带项目号端点以及 `us` / `eu` 多区域端点（`aiplatform.{us|eu}.rep.googleapis.com`）时的域名错误，并在区域下拉建议中补充 `us` 和 `eu`。
 - **TauriTavern**：扩展自动订阅 TauriTavern 内置的底层 LLM 请求日志（`llmApiLogs`）并将账本和定价写入原生 `extension.store`：
   - 流式请求直接解析原始 SSE 响应块中的完整 `usageMetadata`（含缓存、思考、模态、联网搜索与中途停止）；
   - 非流式请求从 TauriTavern 归一化后的 `usage` 还原输入、缓存命中、正文输出与思考 Token 用量（推荐开启流式以获取最完整的原始字段）。
 
-## 计费规则
+## 计费规则与动态清单
 
+- **动态同步模型与价格**：插件不再硬编码模型列表与价格表，启动时及每 12 小时自动从 [models.dev](https://models.dev/) 拉取最新的 `google-vertex` 模型清单与定价并缓存到本地（也可在定价页点击“同步最新清单”手动触发）；
+  - 从旧版本升级时会一次性平滑迁移至 `models.dev` 清单（自动保留用户自行添加的非默认模型）；
+  - 后续同步时，新增模型自动入表，未手动修改过的默认模型随远端自动更新，用户自行修改或删除的模型永久保留不被覆盖；
+  - 对 Gemini 3 及以上正式版自动按谷歌官方规则推算非 `global` 区域端点 +10% 区域价；
 - 缓存部分（`cachedContentTokenCount`）按缓存价，其余输入按输入价；`toolUsePromptTokenCount` 按输入价；
 - 思考 Token（`thoughtsTokenCount`）按输出价；
 - 提示词超过"长上下文阈值"时，整次请求的输入/输出/缓存都改用"长·"价格；
 - 区域端点（非 global）使用 `nonGlobal` 价格；
-- 只按官方标准价计费，限时优惠（赠金返还）不计入；
 - 按 `promptTokensDetails` 等的模态区分音频输入、图片输出价格（未填写则按普通价）。
 
 ## 许可证

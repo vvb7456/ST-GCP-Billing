@@ -1,22 +1,18 @@
 // Pure runtime-agnostic billing helpers shared by the SillyTavern server plugin and the TauriTavern frontend adapter.
 import { findPrice, calculateCost } from './pricing.js';
 
-export const GEMINI_4_MODELS = [
-    'gemini-4-neon',
-    'gemini-4-hydrogen',
-    'gemini-4-carbon',
-    'gemini-4-argon',
-];
+export const MODELS_DEV_URL = 'https://models.dev/api.json';
+export const CATALOG_SYNC_INTERVAL_MS = 12 * 60 * 60 * 1000;
 
 const VERTEX_PATH = /\/projects\/([^/]+)\/locations\/([^/]+)\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$|\/publishers\/[^/]+\/models\/([^/:]+):(streamGenerateContent|generateContent)$/;
 const PROJECT_LOCATION_PATH = /\/projects\/([^/]+)\/locations\/([^/]+)/;
 const TAURI_GEMINI_ENDPOINT_SUFFIX = /(?:\/|:)(streamGenerateContent|generateContent)$/i;
 const GOOGLE_AGENT_PLATFORM_HOST = /^(?:aiplatform\.googleapis\.com|[a-z0-9-]+-aiplatform\.googleapis\.com|aiplatform\.[a-z0-9-]+\.rep\.googleapis\.com)$/;
-const GEMINI_4_MODEL_RE = /^gemini-4(?:\.\d+)?-/i;
+const GEMINI_4_PLUS_MODEL_RE = /^gemini-([4-9]|\d{2,})(?:\.\d+)?-/i;
 const GEMINI_4_XHIGH_RE = /^gemini-4(?:\.\d+)?-(?:neon|hydrogen)(?:$|[-@])/i;
 
 export function isGemini4Model(model) {
-    return GEMINI_4_MODEL_RE.test(String(model || '').trim());
+    return GEMINI_4_PLUS_MODEL_RE.test(String(model || '').trim());
 }
 
 /**
@@ -232,31 +228,228 @@ export function priceRecord(record, pricing) {
     return record;
 }
 
-/**
- * Merges newly introduced built-in models from `defaultPricing` into a user's saved settings without
- * overwriting customized prices or reviving built-in models the user previously deleted.
- * Returns true if `settings` was mutated and should be persisted.
- */
-export function syncNewDefaultPricing(settings, defaultPricing) {
-    settings.pricing ??= {};
-    const known = new Set(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []);
-    let changed = !Array.isArray(settings.knownDefaultModels);
+function roundRate(v) {
+    return Math.round(Number(v) * 1e6) / 1e6;
+}
 
-    for (const [key, price] of Object.entries(defaultPricing)) {
-        if (!known.has(key)) {
-            if (!(key in settings.pricing)) {
-                settings.pricing[key] = structuredClone(price);
-                changed = true;
+function stableJson(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+    const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
+    return '{' + keys.map(k => JSON.stringify(k) + ':' + stableJson(value[k])).join(',') + '}';
+}
+
+function parseGeminiVersion(id) {
+    const m = /^gemini-(\d+)(?:\.(\d+))?-/.exec(id);
+    if (!m) return null;
+    return { major: Number(m[1]), minor: m[2] !== undefined ? Number(m[2]) : 0, raw: m[2] !== undefined ? `${m[1]}.${m[2]}` : m[1] };
+}
+
+/**
+ * Parses `https://models.dev/api.json` (`google-vertex` provider) into our pricing table and Vertex dropdown groups.
+ * - Filters out deprecated models and non-chat endpoints (embedding, TTS, live, customtools duplicates).
+ * - Automatically synthesizes +10% `nonGlobal` regional rates for GA Gemini 3+ models (preview/beta stay global-only).
+ */
+export function parseModelsDevCatalog(data) {
+    const providerModels = data?.['google-vertex']?.models;
+    if (!providerModels || typeof providerModels !== 'object') {
+        throw new Error('models.dev response is missing google-vertex models');
+    }
+
+    const activeEntries = [];
+    for (const [id, m] of Object.entries(providerModels)) {
+        if (!m || typeof m !== 'object') continue;
+        if (!id.startsWith('gemini-')) continue;
+        if (m.status === 'deprecated') continue;
+        if (/(?:embedding|-tts(?:$|[-])|-live(?:$|[-])|-transcribe|-translate|-customtools$)/i.test(id)) continue;
+
+        const cost = m.cost;
+        if (!cost || typeof cost.input !== 'number' || typeof cost.output !== 'number' || cost.output <= 0) continue;
+
+        const ver = parseGeminiVersion(id);
+        const isImageOnly = /-image(?:$|[-])|nano-banana/i.test(id);
+        const isPreview = m.status === 'beta' || /-preview(?:$|[-])/i.test(id);
+
+        const entry = {
+            input: roundRate(cost.input),
+            output: roundRate(cost.output),
+        };
+        if (typeof cost.cache_read === 'number') {
+            entry.cachedInput = roundRate(cost.cache_read);
+        }
+        if (typeof cost.input_audio === 'number' && cost.input_audio !== cost.input) {
+            entry.inputAudio = roundRate(cost.input_audio);
+            if (entry.cachedInput != null && cost.input > 0) {
+                entry.cachedInputAudio = roundRate(entry.cachedInput * (cost.input_audio / cost.input));
             }
-            known.add(key);
-            changed = true;
+        }
+
+        const contextTier = Array.isArray(cost.tiers)
+            ? cost.tiers.find(t => t?.tier?.type === 'context' && t.tier.size > 0)
+            : null;
+        const over200k = contextTier || (cost.context_over_200k ? { ...cost.context_over_200k, tier: { size: 200000 } } : null);
+        if (over200k && typeof over200k.input === 'number' && typeof over200k.output === 'number') {
+            entry.longContextThreshold = Number(over200k.tier.size) || 200000;
+            entry.long = {
+                input: roundRate(over200k.input),
+                output: roundRate(over200k.output),
+                ...(typeof over200k.cache_read === 'number' ? { cachedInput: roundRate(over200k.cache_read) } : {}),
+            };
+        }
+
+        // Google Cloud applies a uniform +10% regional premium on GA Gemini 3+ non-global endpoints.
+        if (ver && ver.major >= 3 && !isPreview && !isImageOnly) {
+            const nonGlobal = {
+                input: roundRate(entry.input * 1.1),
+                output: roundRate(entry.output * 1.1),
+            };
+            if (entry.cachedInput != null) nonGlobal.cachedInput = roundRate(entry.cachedInput * 1.1);
+            if (entry.inputAudio != null) nonGlobal.inputAudio = roundRate(entry.inputAudio * 1.1);
+            if (entry.cachedInputAudio != null) nonGlobal.cachedInputAudio = roundRate(entry.cachedInputAudio * 1.1);
+            if (entry.long) {
+                nonGlobal.long = {
+                    input: roundRate(entry.long.input * 1.1),
+                    output: roundRate(entry.long.output * 1.1),
+                    ...(entry.long.cachedInput != null ? { cachedInput: roundRate(entry.long.cachedInput * 1.1) } : {}),
+                };
+            }
+            entry.nonGlobal = nonGlobal;
+        }
+
+        activeEntries.push({
+            id,
+            ver,
+            isImageOnly,
+            outModalities: Array.isArray(m.modalities?.output) ? m.modalities.output : ['text'],
+            releaseDate: String(m.release_date || ''),
+            entry,
+        });
+    }
+
+    // Sort newest major/minor version first, then newest release date first.
+    activeEntries.sort((a, b) => {
+        const av = a.ver || { major: 0, minor: 0 };
+        const bv = b.ver || { major: 0, minor: 0 };
+        if (bv.major !== av.major) return bv.major - av.major;
+        if (bv.minor !== av.minor) return bv.minor - av.minor;
+        if (b.releaseDate !== a.releaseDate) return b.releaseDate.localeCompare(a.releaseDate);
+        return a.id.localeCompare(b.id);
+    });
+
+    const pricing = {};
+    const groupMap = new Map();
+    for (const item of activeEntries) {
+        pricing[item.id] = item.entry;
+        if (item.ver && item.ver.major >= 3 && !item.isImageOnly && item.outModalities.includes('text')) {
+            const label = `Gemini ${item.ver.raw}`;
+            if (!groupMap.has(label)) groupMap.set(label, []);
+            groupMap.get(label).push(item.id);
         }
     }
 
-    if (changed) {
+    const vertexModelGroups = [...groupMap.entries()].map(([label, models]) => ({ label, models }));
+    return {
+        source: 'models.dev',
+        pricing,
+        vertexModelGroups,
+        modelCount: Object.keys(pricing).length,
+    };
+}
+
+export async function fetchModelsDevCatalog({ fetchImpl = globalThis.fetch, url = MODELS_DEV_URL, timeoutMs = 15000 } = {}) {
+    if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetchImpl(url, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+            signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`models.dev HTTP ${res.status}`);
+        const json = await res.json();
+        return parseModelsDevCatalog(json);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// Keys shipped in legacy v1.0-v1.3.1 hardcoded DEFAULT_PRICING, used solely for one-time migration to models.dev.
+const LEGACY_BUILTIN_KEYS = new Set([
+    'gemini-4-neon',
+    'gemini-4-hydrogen',
+    'gemini-4-carbon',
+    'gemini-4-argon',
+    'gemini-3.8-flash',
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-pro',
+    'gemini-3.1-flash-lite',
+    'gemini-3-flash',
+]);
+
+/**
+ * Applies a freshly fetched upstream catalog to `settings`:
+ * - One-time migration from legacy hardcoded pricing (`!settings.migratedToModelsDev`):
+ *   replaces old hardcoded entries (including shortened prefixes & deprecated models) with the live models.dev
+ *   catalog while preserving any extra user-defined custom model keys.
+ * - Steady-state sync (`settings.migratedToModelsDev === true`):
+ *   adds newly introduced models, updates prices of unmodified upstream models, and preserves user edits/deletions.
+ */
+export function applyCatalogSync(settings, catalog) {
+    const nextDefaults = catalog.pricing || {};
+    settings.pricing ??= {};
+
+    let added = 0;
+    let updated = 0;
+    let migrated = false;
+
+    if (!settings.migratedToModelsDev) {
+        migrated = true;
+        const legacyKnown = new Set([
+            ...LEGACY_BUILTIN_KEYS,
+            ...(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []),
+        ]);
+        const nextPricing = structuredClone(nextDefaults);
+        // Preserve any non-legacy custom models the user manually added.
+        for (const [k, v] of Object.entries(settings.pricing)) {
+            if (!legacyKnown.has(k) && !(k in nextPricing)) {
+                nextPricing[k] = v;
+            }
+        }
+        added = Object.keys(nextDefaults).length;
+        settings.pricing = nextPricing;
+        settings.upstreamPricing = structuredClone(nextDefaults);
+        settings.knownDefaultModels = Object.keys(nextDefaults);
+        settings.migratedToModelsDev = true;
+    } else {
+        const prevUpstream = settings.upstreamPricing || {};
+        const known = new Set(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []);
+        for (const [key, nextPrice] of Object.entries(nextDefaults)) {
+            if (!known.has(key)) {
+                if (!(key in settings.pricing)) {
+                    settings.pricing[key] = structuredClone(nextPrice);
+                    added += 1;
+                }
+                known.add(key);
+            } else if (key in settings.pricing) {
+                const prevPrice = prevUpstream[key];
+                if (prevPrice && stableJson(settings.pricing[key]) === stableJson(prevPrice) && stableJson(prevPrice) !== stableJson(nextPrice)) {
+                    settings.pricing[key] = structuredClone(nextPrice);
+                    updated += 1;
+                }
+            }
+        }
+        settings.upstreamPricing = structuredClone(nextDefaults);
         settings.knownDefaultModels = [...known];
     }
-    return changed;
+
+    settings.vertexModelGroups = Array.isArray(catalog.vertexModelGroups) ? catalog.vertexModelGroups : [];
+    settings.catalogSource = catalog.source || 'models.dev';
+    settings.catalogSyncedAt = Date.now();
+    return { added, updated, migrated };
 }
 
 /** Prices only historical records that previously had no price (`!rec.cost`) when a price now exists. */

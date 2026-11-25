@@ -1,60 +1,5 @@
-// USD per 1M tokens, Standard (on-demand) tier, taken from the official pricing page
-// https://cloud.google.com/vertex-ai/generative-ai/pricing (Agent Platform Pricing) as of 2026-11-25.
-// Base fields are Global-endpoint prices; `nonGlobal` overrides apply to regional endpoints.
-// Time-limited promotional prices are intentionally not modeled: list prices only.
-export const PRICING_UPDATED_AT = '2026-11-25';
-
-export const DEFAULT_PRICING = {
-    'gemini-4-neon': {
-        input: 3.0, cachedInput: 0.15, output: 15.0,
-        nonGlobal: { input: 3.3, cachedInput: 0.165, output: 16.5 },
-    },
-    'gemini-4-hydrogen': {
-        input: 1.5, cachedInput: 0.075, output: 7.5,
-        nonGlobal: { input: 1.65, cachedInput: 0.0825, output: 8.25 },
-    },
-    'gemini-4-carbon': {
-        input: 4.0, cachedInput: 0.2, output: 20.0,
-        nonGlobal: { input: 4.4, cachedInput: 0.22, output: 22.0 },
-    },
-    'gemini-4-argon': {
-        input: 4.0, cachedInput: 0.2, output: 20.0,
-        nonGlobal: { input: 4.4, cachedInput: 0.22, output: 22.0 },
-    },
-    'gemini-3.8-flash': {
-        input: 1.5, cachedInput: 0.15, output: 7.5,
-        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
-    },
-    'gemini-3.7-flash': {
-        input: 1.5, cachedInput: 0.15, output: 7.5,
-        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
-    },
-    'gemini-3.6-flash': {
-        input: 1.5, cachedInput: 0.15, output: 7.5,
-        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 8.25 },
-    },
-    'gemini-3.5-flash': {
-        input: 1.5, cachedInput: 0.15, output: 9.0,
-        nonGlobal: { input: 1.65, cachedInput: 0.165, output: 9.9 },
-    },
-    'gemini-3.5-flash-lite': {
-        input: 0.3, cachedInput: 0.03, output: 2.5,
-        nonGlobal: { input: 0.33, cachedInput: 0.033, output: 2.75 },
-    },
-    'gemini-3.1-pro': {
-        input: 2.0, cachedInput: 0.2, output: 12.0,
-        longContextThreshold: 200000,
-        long: { input: 4.0, cachedInput: 0.4, output: 18.0 },
-    },
-    'gemini-3.1-flash-lite': {
-        input: 0.25, inputAudio: 0.5, cachedInput: 0.025, cachedInputAudio: 0.05, output: 1.5,
-        nonGlobal: { input: 0.275, inputAudio: 0.55, cachedInput: 0.0275, cachedInputAudio: 0.055, output: 1.65 },
-    },
-    // The Standard table omits the output row for this model; 3.00 = Priority output (5.40) / 1.8 Priority multiplier.
-    'gemini-3-flash': {
-        input: 0.5, inputAudio: 1.0, cachedInput: 0.05, cachedInputAudio: 0.1, output: 3.0,
-    },
-};
+// Pure pricing lookup & cost calculation engine (USD per 1M tokens).
+// Model pricing data is synced dynamically from https://models.dev/api.json (google-vertex).
 
 export const RATE_FIELDS = ['input', 'inputAudio', 'cachedInput', 'cachedInputAudio', 'output', 'outputImage'];
 
@@ -63,7 +8,7 @@ export const RATE_FIELDS = ['input', 'inputAudio', 'cachedInput', 'cachedInputAu
  * (so "gemini-3.5-flash-lite" hits its own entry, not "gemini-3.5-flash").
  */
 export function findPrice(pricing, model) {
-    if (!model) return null;
+    if (!pricing || !model) return null;
     if (pricing[model]) return { key: model, price: pricing[model] };
     let best = null;
     for (const key of Object.keys(pricing)) {

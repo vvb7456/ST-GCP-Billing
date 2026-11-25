@@ -1,12 +1,13 @@
 // TauriTavern local backend adapter: reads Vertex AI responses from TauriTavern's built-in LLM API log store
 // and persists billing settings & ledger to TauriTavern's native extensionStore (no Node server plugin needed).
-import { DEFAULT_PRICING, PRICING_UPDATED_AT } from '../server/pricing.js';
 import {
+    CATALOG_SYNC_INTERVAL_MS,
     parseTauriEndpoint,
     parseTauriSseRaw,
     parseTauriNormalizedResponse,
     priceRecord,
-    syncNewDefaultPricing,
+    applyCatalogSync,
+    fetchModelsDevCatalog,
     priceUnpricedRecords,
     createRecord,
     summarize,
@@ -55,19 +56,29 @@ export async function createTauriTavernBackend({
     llmApiLogs = globalThis.__TAURITAVERN__?.api?.dev?.llmApiLogs,
     extensionStore = globalThis.__TAURITAVERN__?.api?.extension?.store,
     onRecord = null,
+    onCatalogUpdated = null,
+    autoSync = true,
+    fetchImpl = globalThis.fetch,
 } = {}) {
     if (!llmApiLogs || !extensionStore) {
         throw new Error('TauriTavern native APIs (llmApiLogs / extension.store) are unavailable');
     }
 
     let settings = {
-        pricing: structuredClone(DEFAULT_PRICING),
-        knownDefaultModels: Object.keys(DEFAULT_PRICING),
+        pricing: {},
+        upstreamPricing: {},
+        knownDefaultModels: [],
+        vertexModelGroups: [],
+        catalogSource: null,
+        catalogSyncedAt: null,
+        migratedToModelsDev: false,
     };
     let records = [];
     let lastLogId = null;
     const seen = new Set();
     let unsubscribe = null;
+    let syncTimer = null;
+    let syncInFlight = null;
 
     // Serialize all mutations and store writes so concurrent requests / UI actions never race.
     let queue = Promise.resolve();
@@ -80,6 +91,36 @@ export async function createTauriTavernBackend({
     const saveSettings = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_SETTINGS, value: settings });
     const saveLedger = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_LEDGER, value: records });
     const saveMeta = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_META, value: { lastLogId } });
+
+    async function syncCatalog({ notify = false } = {}) {
+        if (syncInFlight) return syncInFlight;
+        syncInFlight = (async () => {
+            const catalog = await fetchModelsDevCatalog({ fetchImpl });
+            return enqueue(async () => {
+                const result = applyCatalogSync(settings, catalog);
+                await saveSettings();
+
+                const repriced = priceUnpricedRecords(records, settings.pricing);
+                if (repriced > 0) await saveLedger();
+                if (notify && (result.added > 0 || result.updated > 0 || result.migrated || repriced > 0) && typeof onCatalogUpdated === 'function') {
+                    onCatalogUpdated();
+                }
+                return {
+                    ok: true,
+                    source: catalog.source,
+                    syncedAt: settings.catalogSyncedAt,
+                    modelCount: catalog.modelCount,
+                    added: result.added,
+                    updated: result.updated,
+                    migrated: result.migrated,
+                    repriced,
+                };
+            });
+        })().finally(() => {
+            syncInFlight = null;
+        });
+        return syncInFlight;
+    }
 
     async function processEntry(entry, { isLive }) {
         if (!entry || typeof entry.id !== 'number') return;
@@ -151,16 +192,9 @@ export async function createTauriTavernBackend({
             extensionStore.tryGetJson({ namespace: STORE_NAMESPACE, key: KEY_META }).catch(() => ({ found: false })),
         ]);
 
-        let settingsChanged = false;
         if (savedSettings?.found && savedSettings.value && typeof savedSettings.value === 'object') {
-            settings = {
-                pricing: structuredClone(DEFAULT_PRICING),
-                ...savedSettings.value,
-            };
-            if (!Array.isArray(savedSettings.value.knownDefaultModels)) delete settings.knownDefaultModels;
-            settingsChanged = syncNewDefaultPricing(settings, DEFAULT_PRICING);
+            settings = { ...settings, ...savedSettings.value };
         }
-        if (settingsChanged) await saveSettings();
 
         if (savedLedger?.found && Array.isArray(savedLedger.value)) {
             records = savedLedger.value;
@@ -199,7 +233,29 @@ export async function createTauriTavernBackend({
     });
     await initPromise;
 
+    if (autoSync) {
+        const needsSync = !settings.migratedToModelsDev
+            || !settings.catalogSyncedAt
+            || (Date.now() - settings.catalogSyncedAt >= CATALOG_SYNC_INTERVAL_MS);
+        if (needsSync) {
+            syncCatalog({ notify: true }).catch((e) => {
+                console.warn('[agent-platform-billing] [TauriTavern] models.dev sync failed:', e.message);
+            });
+        }
+        syncTimer = setInterval(() => {
+            syncCatalog({ notify: true }).catch((e) => {
+                console.warn('[agent-platform-billing] [TauriTavern] periodic models.dev sync failed:', e.message);
+            });
+        }, CATALOG_SYNC_INTERVAL_MS);
+    }
+
     async function handle(endpoint, body = {}) {
+        if (endpoint === '/catalog/sync') {
+            return syncCatalog();
+        }
+        if (endpoint === '/settings/get' && syncInFlight && !settings.catalogSyncedAt) {
+            await syncInFlight.catch(() => {});
+        }
         return enqueue(async () => {
             if (endpoint === '/summary') {
                 const since = Number(body?.since) || 0;
@@ -215,7 +271,10 @@ export async function createTauriTavernBackend({
                 return { items: records.slice(-limit).reverse(), total: records.length };
             }
             if (endpoint === '/settings/get') {
-                return { ...settings, defaultPricing: DEFAULT_PRICING, pricingUpdatedAt: PRICING_UPDATED_AT };
+                return {
+                    ...settings,
+                    defaultPricing: settings.upstreamPricing || {},
+                };
             }
             if (endpoint === '/settings/save') {
                 const { pricing } = body || {};
@@ -245,6 +304,10 @@ export async function createTauriTavernBackend({
     return {
         handle,
         async dispose() {
+            if (syncTimer) {
+                clearInterval(syncTimer);
+                syncTimer = null;
+            }
             if (typeof unsubscribe === 'function') {
                 await unsubscribe();
                 unsubscribe = null;

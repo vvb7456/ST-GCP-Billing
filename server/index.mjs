@@ -4,9 +4,8 @@ import http from 'node:http';
 import https from 'node:https';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_PRICING, PRICING_UPDATED_AT } from './pricing.js';
 import {
-    GEMINI_4_MODELS,
+    CATALOG_SYNC_INTERVAL_MS,
     isGemini4Model,
     buildGemini4ThinkingConfig,
     fixVertexUrl,
@@ -14,7 +13,8 @@ import {
     absorb,
     parseNonStreamBody,
     priceRecord,
-    syncNewDefaultPricing,
+    applyCatalogSync,
+    fetchModelsDevCatalog,
     priceUnpricedRecords,
     createRecord,
     summarize,
@@ -26,8 +26,13 @@ const LEDGER_FILE = path.join(DATA_DIR, 'ledger.jsonl');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULT_SETTINGS = {
-    pricing: DEFAULT_PRICING,
-    knownDefaultModels: Object.keys(DEFAULT_PRICING),
+    pricing: {},
+    upstreamPricing: {},
+    knownDefaultModels: [],
+    vertexModelGroups: [],
+    catalogSource: null,
+    catalogSyncedAt: null,
+    migratedToModelsDev: false,
     stCompat: true,
 };
 
@@ -37,21 +42,86 @@ let records = [];
 const TEST_HOSTS = (process.env.AGENT_PLATFORM_BILLING_TEST_HOSTS || '').split(',').map(h => h.trim()).filter(Boolean);
 const restoreFns = [];
 const generateContext = new AsyncLocalStorage();
+let syncInFlight = null;
+let stFetch = globalThis.fetch;
+
+async function fetchWithEnvProxyFallback(url, options) {
+    try {
+        return await stFetch(url, options);
+    } catch (firstErr) {
+        const hasEnvProxy = Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy);
+        if (!hasEnvProxy) throw firstErr;
+        try {
+            const proxyAgentEntry = path.join(process.cwd(), 'node_modules', 'proxy-agent', 'dist', 'index.js');
+            const { ProxyAgent } = await import(new URL('file://' + fs.realpathSync(proxyAgentEntry)).href);
+            return await stFetch(url, { ...options, agent: new ProxyAgent() });
+        } catch {
+            throw firstErr;
+        }
+    }
+}
+
+async function syncCatalogFromModelsDev() {
+    if (syncInFlight) return syncInFlight;
+    syncInFlight = (async () => {
+        // Use ST's node-fetch instance so requests honor ST's requestProxy, falling back to env proxy if needed.
+        const catalog = await fetchModelsDevCatalog({ fetchImpl: fetchWithEnvProxyFallback });
+        const result = applyCatalogSync(settings, catalog);
+        saveSettings();
+
+        const repriced = priceUnpricedRecords(records, settings.pricing);
+        if (repriced > 0) rewriteLedger();
+        console.info(`[agent-platform-billing] synced catalog from ${catalog.source}: ${catalog.modelCount} model(s), +${result.added} added, ${result.updated} updated, ${repriced} repriced${result.migrated ? ' (migrated)' : ''}`);
+        return {
+            ok: true,
+            source: catalog.source,
+            syncedAt: settings.catalogSyncedAt,
+            modelCount: catalog.modelCount,
+            added: result.added,
+            updated: result.updated,
+            migrated: result.migrated,
+            repriced,
+        };
+    })().finally(() => {
+        syncInFlight = null;
+    });
+    return syncInFlight;
+}
+
+function scheduleCatalogSync() {
+    if (process.env.AGENT_PLATFORM_BILLING_DISABLE_AUTO_SYNC === '1') return;
+    const needsSync = !settings.migratedToModelsDev
+        || !settings.catalogSyncedAt
+        || (Date.now() - settings.catalogSyncedAt >= CATALOG_SYNC_INTERVAL_MS);
+    if (needsSync) {
+        // Defer briefly so ST finishes initRequestProxy() before our first outbound sync request.
+        const bootTimer = setTimeout(() => {
+            syncCatalogFromModelsDev().catch((e) => {
+                console.warn('[agent-platform-billing] models.dev catalog sync failed:', e.message);
+            });
+        }, 1500);
+        bootTimer.unref?.();
+        restoreFns.push(() => clearTimeout(bootTimer));
+    }
+    const timer = setInterval(() => {
+        syncCatalogFromModelsDev().catch((e) => {
+            console.warn('[agent-platform-billing] periodic models.dev sync failed:', e.message);
+        });
+    }, CATALOG_SYNC_INTERVAL_MS);
+    timer.unref?.();
+    restoreFns.push(() => clearInterval(timer));
+}
 
 function loadState() {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    let settingsChanged = false;
     if (fs.existsSync(SETTINGS_FILE)) {
         try {
             const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
             settings = { ...structuredClone(DEFAULT_SETTINGS), ...saved };
-            if (!Array.isArray(saved.knownDefaultModels)) delete settings.knownDefaultModels;
-            settingsChanged = syncNewDefaultPricing(settings, DEFAULT_PRICING);
         } catch (e) {
-            console.error('[agent-platform-billing] settings.json is corrupted, using defaults:', e.message);
+            console.error('[agent-platform-billing] settings.json is corrupted, using empty defaults:', e.message);
         }
     }
-    if (settingsChanged) saveSettings();
 
     records = [];
     if (fs.existsSync(LEDGER_FILE)) {
@@ -262,6 +332,7 @@ function installCompatHooks(router) {
 async function installHooks() {
     const nodeFetchEntry = path.join(process.cwd(), 'node_modules', 'node-fetch', 'src', 'index.js');
     const mod = await import(new URL('file://' + fs.realpathSync(nodeFetchEntry)).href);
+    if (typeof mod.default === 'function') stFetch = mod.default;
     const Response = mod.Response;
     const bodyProto = Object.getPrototypeOf(Response.prototype);
 
@@ -326,6 +397,7 @@ export async function init(router) {
     loadState();
     installCompatHooks(router);
     await installHooks();
+    scheduleCatalogSync();
     console.info(`[agent-platform-billing] hooks installed, ${records.length} record(s) loaded`);
 
     router.post('/summary', (req, res) => {
@@ -343,13 +415,24 @@ export async function init(router) {
         res.json({ items: records.slice(-limit).reverse(), total: records.length });
     });
 
-    router.post('/settings/get', (_req, res) => {
+    router.post('/settings/get', async (_req, res) => {
+        if (!settings.catalogSyncedAt && process.env.AGENT_PLATFORM_BILLING_DISABLE_AUTO_SYNC !== '1') {
+            await (syncInFlight || syncCatalogFromModelsDev()).catch(() => {});
+        }
         res.json({
             ...settings,
-            defaultPricing: DEFAULT_PRICING,
-            pricingUpdatedAt: PRICING_UPDATED_AT,
-            gemini4Models: GEMINI_4_MODELS,
+            defaultPricing: settings.upstreamPricing || {},
+            vertexCompatModelGroups: settings.vertexModelGroups || [],
         });
+    });
+
+    router.post('/catalog/sync', async (_req, res) => {
+        try {
+            res.json(await syncCatalogFromModelsDev());
+        } catch (e) {
+            console.warn('[agent-platform-billing] manual catalog sync failed:', e.message);
+            res.status(502).json({ error: e.message });
+        }
     });
 
     router.post('/settings/save', (req, res) => {
