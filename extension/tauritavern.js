@@ -7,6 +7,7 @@ import {
     parseTauriNormalizedResponse,
     priceRecord,
     applyCatalogSync,
+    recordOfflineUserEdits,
     fetchModelsDevCatalog,
     priceUnpricedRecords,
     createRecord,
@@ -18,7 +19,8 @@ const KEY_SETTINGS = 'settings';
 const KEY_LEDGER = 'ledger';
 const KEY_META = 'meta';
 
-const RAW_RETRY_DELAYS_MS = [40, 80, 120, 180, 250, 350, 500];
+const RAW_RETRY_DELAYS_MS = [40, 80, 120, 200, 350, 500, 750, 1000];
+const MAX_PROCESSED_KEYS = 200;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -75,7 +77,9 @@ export async function createTauriTavernBackend({
     };
     let records = [];
     let lastLogId = null;
-    const seen = new Set();
+    let lastLogTimestampMs = 0;
+    let processedKeys = [];
+    const processedSet = new Set();
     let unsubscribe = null;
     let syncTimer = null;
     let syncInFlight = null;
@@ -90,7 +94,31 @@ export async function createTauriTavernBackend({
 
     const saveSettings = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_SETTINGS, value: settings });
     const saveLedger = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_LEDGER, value: records });
-    const saveMeta = () => extensionStore.setJson({ namespace: STORE_NAMESPACE, key: KEY_META, value: { lastLogId } });
+    const saveMeta = () => extensionStore.setJson({
+        namespace: STORE_NAMESPACE,
+        key: KEY_META,
+        value: { lastLogId, lastLogTimestampMs, processedKeys },
+    });
+
+    function markProcessed(dedupeKey, entry, { resetCursor = false } = {}) {
+        if (!processedSet.has(dedupeKey)) {
+            processedSet.add(dedupeKey);
+            processedKeys.push(dedupeKey);
+            while (processedKeys.length > MAX_PROCESSED_KEYS) {
+                const evicted = processedKeys.shift();
+                processedSet.delete(evicted);
+            }
+        }
+        const entryTs = Number(entry.timestampMs) || 0;
+        if (resetCursor || lastLogId === null) {
+            lastLogId = entry.id;
+        } else {
+            lastLogId = Math.max(lastLogId, entry.id);
+        }
+        if (entryTs > lastLogTimestampMs) {
+            lastLogTimestampMs = entryTs;
+        }
+    }
 
     async function syncCatalog({ notify = false } = {}) {
         if (syncInFlight) return syncInFlight;
@@ -125,25 +153,44 @@ export async function createTauriTavernBackend({
     async function processEntry(entry, { isLive }) {
         if (!entry || typeof entry.id !== 'number') return;
         const dedupeKey = `${entry.id}:${entry.timestampMs ?? 0}`;
-        if (seen.has(dedupeKey)) return;
-        seen.add(dedupeKey);
+        if (processedSet.has(dedupeKey)) return;
 
-        if (lastLogId !== null && entry.id <= lastLogId) return;
-        lastLogId = entry.id;
-        await saveMeta();
+        // During startup catch-up, only process logs strictly newer than the saved cursor.
+        // Live subscriptions can legitimately arrive with entry.id <= lastLogId when logs were cleared
+        // mid-session (IDs restart from 1) or when concurrent requests finish out of order.
+        if (!isLive && lastLogId !== null && entry.id <= lastLogId) return;
 
-        if (entry.source !== 'vertexai') return;
+        const entryTs = Number(entry.timestampMs) || 0;
+        const isLogReset = isLive
+            && lastLogId !== null
+            && entry.id < lastLogId
+            && (entry.id === 1 || (entryTs > 0 && entryTs >= lastLogTimestampMs && lastLogId - entry.id > 1));
+
+        if (entry.source !== 'vertexai') {
+            markProcessed(dedupeKey, entry, { resetCursor: isLogReset });
+            await saveMeta();
+            return;
+        }
         const info = parseTauriEndpoint(entry.endpoint, entry.model, Boolean(entry.stream), getTestHosts());
-        if (!info) return;
+        if (!info) {
+            markProcessed(dedupeKey, entry, { resetCursor: isLogReset });
+            await saveMeta();
+            return;
+        }
 
         const complete = Boolean(entry.ok);
         // Upstream HTTP errors are not recorded; cancelled streams (WARN) are parsed for partial usageMetadata.
-        if (!complete && !(entry.stream && entry.level === 'WARN')) return;
+        if (!complete && !(entry.stream && entry.level === 'WARN')) {
+            markProcessed(dedupeKey, entry, { resetCursor: isLogReset });
+            await saveMeta();
+            return;
+        }
 
         let raw;
         try {
             raw = await getRawWithRetry(llmApiLogs, entry.id, complete);
         } catch (e) {
+            // Do not advance the processed cursor on transient read failures so catch-up can recover it.
             console.error('[agent-platform-billing] failed to read TauriTavern LLM API log:', e);
             return;
         }
@@ -154,6 +201,8 @@ export async function createTauriTavernBackend({
                 payload = parseTauriSseRaw(raw.responseRaw, complete);
                 if (!payload.usage && !complete) {
                     console.warn(`[agent-platform-billing] ${info.model} stream closed before any usageMetadata arrived; Google may still bill this request`);
+                    markProcessed(dedupeKey, entry, { resetCursor: isLogReset });
+                    await saveMeta();
                     return;
                 }
             } else if (raw.responseRaw) {
@@ -168,13 +217,15 @@ export async function createTauriTavernBackend({
 
         const rawTs = isLive
             ? Date.now()
-            : ((Number(entry.timestampMs) || Date.now()) + (Number(entry.durationMs) || 0));
+            : ((entryTs || Date.now()) + (Number(entry.durationMs) || 0));
         const prevTs = records.at(-1)?.ts ?? 0;
         const ts = rawTs <= prevTs ? prevTs + 1 : rawTs;
 
         const rec = createRecord(info, payload, settings.pricing, { ts });
         records.push(rec);
+        markProcessed(dedupeKey, entry, { resetCursor: isLogReset });
         await saveLedger();
+        await saveMeta();
 
         const usage = rec.usage;
         const c = rec.cost ? `$${rec.cost.total.toFixed(6)}` : '未定价';
@@ -201,8 +252,17 @@ export async function createTauriTavernBackend({
             const repriced = priceUnpricedRecords(records, settings.pricing);
             if (repriced > 0) await saveLedger();
         }
-        if (savedMeta?.found && typeof savedMeta.value?.lastLogId === 'number') {
-            lastLogId = savedMeta.value.lastLogId;
+        if (savedMeta?.found && savedMeta.value && typeof savedMeta.value === 'object') {
+            if (typeof savedMeta.value.lastLogId === 'number') {
+                lastLogId = savedMeta.value.lastLogId;
+            }
+            if (typeof savedMeta.value.lastLogTimestampMs === 'number') {
+                lastLogTimestampMs = savedMeta.value.lastLogTimestampMs;
+            }
+            if (Array.isArray(savedMeta.value.processedKeys)) {
+                processedKeys = savedMeta.value.processedKeys.slice(-MAX_PROCESSED_KEYS);
+                processedKeys.forEach(k => processedSet.add(k));
+            }
         }
 
         // Subscribe before reading index() so any request completing during catch-up queues strictly after init.
@@ -253,9 +313,6 @@ export async function createTauriTavernBackend({
         if (endpoint === '/catalog/sync') {
             return syncCatalog();
         }
-        if (endpoint === '/settings/get' && syncInFlight && !settings.catalogSyncedAt) {
-            await syncInFlight.catch(() => {});
-        }
         return enqueue(async () => {
             if (endpoint === '/summary') {
                 const since = Number(body?.since) || 0;
@@ -274,6 +331,7 @@ export async function createTauriTavernBackend({
                 return {
                     ...settings,
                     defaultPricing: settings.upstreamPricing || {},
+                    catalogSyncing: Boolean(syncInFlight),
                 };
             }
             if (endpoint === '/settings/save') {
@@ -282,6 +340,7 @@ export async function createTauriTavernBackend({
                     if (!pricing || typeof pricing !== 'object' || Array.isArray(pricing)) {
                         throw new Error('pricing must be an object');
                     }
+                    recordOfflineUserEdits(settings, pricing);
                     settings.pricing = pricing;
                 }
                 await saveSettings();

@@ -67,7 +67,7 @@ enableServerPlugins: true
 
 重启酒馆。启动日志出现 `[agent-platform-billing] hooks installed` 即表示加载成功，扩展面板"设置"页会显示"已连接"。
 
-账本和定价保存在插件目录的 `server/data/`（方式 A）或 `data/`（方式 B）下，更新插件不会覆盖。
+账本和定价按酒馆用户目录保存在 `SillyTavern/data/<用户名>/agent-platform-billing/`（单用户模式下为 `data/default-user/agent-platform-billing/`），支持多用户隔离，更新或重装插件不会覆盖；从旧版本升级时，原 `server/data/` 下的账本和定价会自动迁移到 `default-user` 目录，不影响现有数据。
 
 ## 原理
 

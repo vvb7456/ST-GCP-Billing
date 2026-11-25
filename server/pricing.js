@@ -28,6 +28,20 @@ function rates(o) {
     return out;
 }
 
+function applyRateLayer(target, layer) {
+    const r = rates(layer);
+    if (!Object.keys(r).length) return;
+    // If a higher tier overrides the input price without specifying a cached rate, do not silently inherit a lower tier's cheaper cached rate.
+    if (r.input !== undefined && r.cachedInput === undefined) {
+        delete target.cachedInput;
+        delete target.cachedInputAudio;
+    }
+    if (r.inputAudio !== undefined && r.cachedInputAudio === undefined) {
+        delete target.cachedInputAudio;
+    }
+    Object.assign(target, r);
+}
+
 /**
  * Flattens a price entry into the rates that apply to one request.
  * Precedence (later wins): base → nonGlobal; `long` blocks follow the same order.
@@ -41,8 +55,8 @@ export function resolveRates(price, { location = 'global' } = {}) {
     const base = {};
     const long = {};
     for (const layer of layers) {
-        Object.assign(base, rates(layer));
-        Object.assign(long, rates(layer?.long));
+        applyRateLayer(base, layer);
+        applyRateLayer(long, layer?.long);
     }
     return { base, long, regional: regional && !!price.nonGlobal };
 }
@@ -79,7 +93,8 @@ export function calculateCost(usage, price, context = {}) {
 
     const resolved = resolveRates(price, context);
     const isLong = num(price.longContextThreshold) > 0 && prompt > num(price.longContextThreshold);
-    const r = isLong ? { ...resolved.base, ...resolved.long } : resolved.base;
+    const r = { ...resolved.base };
+    if (isLong) applyRateLayer(r, resolved.long);
 
     const inputRate = (m) => (m === 'AUDIO' && r.inputAudio != null ? num(r.inputAudio) : num(r.input));
     const cachedRate = (m) => {
@@ -89,16 +104,29 @@ export function calculateCost(usage, price, context = {}) {
     const outputRate = (m) => (m === 'IMAGE' && r.outputImage != null ? num(r.outputImage) : num(r.output));
 
     const promptMod = byModality(usage.promptTokensDetails, prompt);
-    const cacheMod = byModality(usage.cacheTokensDetails, cached);
+    const hasCacheDetails = Array.isArray(usage.cacheTokensDetails) && usage.cacheTokensDetails.length > 0;
     const toolMod = byModality(usage.toolUsePromptTokensDetails, toolUse);
     const candMod = byModality(usage.candidatesTokensDetails, candidates);
 
     let inputCost = 0;
     let cachedCost = 0;
-    for (const [m, total] of Object.entries(promptMod)) {
-        const c = Math.min(cacheMod[m] || 0, total);
-        inputCost += (total - c) * inputRate(m);
-        cachedCost += c * cachedRate(m);
+    if (hasCacheDetails) {
+        const cacheMod = byModality(usage.cacheTokensDetails, cached);
+        for (const [m, total] of Object.entries(promptMod)) {
+            const c = Math.min(cacheMod[m] || 0, total);
+            inputCost += (total - c) * inputRate(m);
+            cachedCost += c * cachedRate(m);
+        }
+    } else {
+        // Without per-modality cache details, allocate cached tokens to TEXT first and spill any remainder to other modalities.
+        let remainingCache = cached;
+        const entries = Object.entries(promptMod).sort(([a], [b]) => (a === 'TEXT' ? -1 : b === 'TEXT' ? 1 : 0));
+        for (const [m, total] of entries) {
+            const c = Math.min(remainingCache, total);
+            remainingCache -= c;
+            inputCost += (total - c) * inputRate(m);
+            cachedCost += c * cachedRate(m);
+        }
     }
     for (const [m, total] of Object.entries(toolMod)) {
         inputCost += total * inputRate(m);

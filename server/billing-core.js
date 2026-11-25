@@ -232,11 +232,24 @@ function roundRate(v) {
     return Math.round(Number(v) * 1e6) / 1e6;
 }
 
-function stableJson(value) {
+export function stableJson(value) {
     if (value === null || typeof value !== 'object') return JSON.stringify(value);
     if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
     const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
     return '{' + keys.map(k => JSON.stringify(k) + ':' + stableJson(value[k])).join(',') + '}';
+}
+
+/** Records only keys added or modified by the user before initial models.dev migration completes. */
+export function recordOfflineUserEdits(settings, nextPricing) {
+    if (settings.migratedToModelsDev) return;
+    const prev = settings.pricing || {};
+    const edited = new Set(Array.isArray(settings.userEditedModels) ? settings.userEditedModels : []);
+    for (const [k, v] of Object.entries(nextPricing)) {
+        if (!(k in prev) || stableJson(prev[k]) !== stableJson(v)) {
+            edited.add(k);
+        }
+    }
+    settings.userEditedModels = [...edited];
 }
 
 function parseGeminiVersion(id) {
@@ -358,19 +371,19 @@ export function parseModelsDevCatalog(data) {
 
 export async function fetchModelsDevCatalog({ fetchImpl = globalThis.fetch, url = MODELS_DEV_URL, timeoutMs = 15000 } = {}) {
     if (typeof fetchImpl !== 'function') throw new Error('fetch is not available');
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
         const res = await fetchImpl(url, {
             method: 'GET',
             headers: { Accept: 'application/json' },
-            signal: controller.signal,
+            ...(controller ? { signal: controller.signal } : {}),
         });
         if (!res.ok) throw new Error(`models.dev HTTP ${res.status}`);
         const json = await res.json();
         return parseModelsDevCatalog(json);
     } finally {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -412,10 +425,11 @@ export function applyCatalogSync(settings, catalog) {
             ...LEGACY_BUILTIN_KEYS,
             ...(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []),
         ]);
+        const userEdited = new Set(Array.isArray(settings.userEditedModels) ? settings.userEditedModels : []);
         const nextPricing = structuredClone(nextDefaults);
-        // Preserve any non-legacy custom models the user manually added.
+        // Preserve any non-legacy custom models and any models the user explicitly saved while offline.
         for (const [k, v] of Object.entries(settings.pricing)) {
-            if (!legacyKnown.has(k) && !(k in nextPricing)) {
+            if (userEdited.has(k) || (!legacyKnown.has(k) && !(k in nextPricing))) {
                 nextPricing[k] = v;
             }
         }
@@ -424,6 +438,7 @@ export function applyCatalogSync(settings, catalog) {
         settings.upstreamPricing = structuredClone(nextDefaults);
         settings.knownDefaultModels = Object.keys(nextDefaults);
         settings.migratedToModelsDev = true;
+        delete settings.userEditedModels;
     } else {
         const prevUpstream = settings.upstreamPricing || {};
         const known = new Set(Array.isArray(settings.knownDefaultModels) ? settings.knownDefaultModels : []);
@@ -498,7 +513,7 @@ function sumInto(bucket, rec) {
     bucket.thoughtsTokens += u.thoughtsTokenCount || 0;
     bucket.totalTokens += u.totalTokenCount || 0;
     if (rec.cost) bucket.cost += rec.cost.total;
-    else bucket.unpriced += 1;
+    else if (rec.usage) bucket.unpriced += 1;
     if (!rec.complete) bucket.incomplete += 1;
     if (rec.grounded) bucket.grounded += 1;
 }
@@ -516,7 +531,7 @@ export function summarize(records, since, todaySince) {
     const unpricedModels = new Set();
     for (const rec of records) {
         sumInto(total, rec);
-        if (!rec.cost) unpricedModels.add(rec.model);
+        if (rec.usage && !rec.cost) unpricedModels.add(rec.model);
         if (todaySince && rec.ts >= todaySince) sumInto(today, rec);
         if (rec.ts >= since) {
             sumInto(period, rec);

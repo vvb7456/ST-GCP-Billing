@@ -1,6 +1,6 @@
 const API = '/api/plugins/agent-platform-billing';
 const MODULE = 'agent_platform_billing';
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const REPO_URL = 'https://github.com/vvb7456/ST-GCP-Billing';
 
 const TABS = [
@@ -31,9 +31,13 @@ const state = {
     initError: null,
 };
 
+let initPromise = null;
 let ttBackend = null;
 let vertexCompatReady = false;
 let vertexSyncing = false;
+let catalogPollTimer = null;
+let lastPricingRenderSig = '';
+let lastRenderedConnected = null;
 
 function isTauriTavern() {
     return Boolean(
@@ -100,6 +104,9 @@ function syncStVertexCompat() {
             vertexSyncing = true;
             existingGroups.forEach(g => g.remove());
             vertexSyncing = false;
+            if (sel.value !== prevValue) {
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+            }
         }
         return;
     }
@@ -178,11 +185,6 @@ function initStVertexCompat() {
 
     syncStVertexCompat();
     restoreSavedGemini4Model();
-    // Re-sync after third-party extensions that initialize inside setTimeout(..., 0).
-    setTimeout(() => {
-        syncStVertexCompat();
-        restoreSavedGemini4Model();
-    }, 80);
 
     // Use capture phase so third-party custom-model extensions calling stopImmediatePropagation() cannot block us.
     sel.addEventListener('change', () => {
@@ -216,10 +218,10 @@ async function ensureBackend() {
     if (ttBackend) return;
     const { createTauriTavernBackend } = await import('./tauritavern.js');
     ttBackend = await createTauriTavernBackend({
-        onRecord: () => refresh({ toastNew: true }),
+        onRecord: () => refresh({ toastNew: true, background: true }),
         onCatalogUpdated: async () => {
             await loadSettings();
-            await refresh();
+            await refresh({ background: true });
         },
     });
     state.initError = null;
@@ -380,14 +382,14 @@ function recordItemHtml(r) {
     const input = (u.promptTokenCount || 0) + (u.toolUsePromptTokenCount || 0);
     const costTitle = r.cost
         ? `输入 ${usd(r.cost.input)} · 缓存 ${usd(r.cost.cached)} · 输出 ${usd(r.cost.output)} · 思考 ${usd(r.cost.thoughts)}`
-        : '该模型尚未定价';
+        : (r.usage ? '该模型尚未定价' : '上游未返回用量');
     return `<div class="vb-record">
         <div class="vb-record-main">
             <div class="vb-record-title">
                 <span class="vb-model" title="${esc(r.modelVersion || r.model)}">${esc(r.model)}</span>
                 ${badges.join('')}
             </div>
-            <div class="vb-record-cost" title="${esc(costTitle)}">${r.cost ? usd(r.cost.total) : '<span class="vb-warn-text">未定价</span>'}</div>
+            <div class="vb-record-cost" title="${esc(costTitle)}">${r.cost ? usd(r.cost.total) : (r.usage ? '<span class="vb-warn-text">未定价</span>' : '<span class="vb-dim">—</span>')}</div>
         </div>
         <div class="vb-record-sub">
             <span title="${esc(new Date(r.ts).toLocaleString())}">${timeLabel(r.ts)}</span>
@@ -443,7 +445,7 @@ function renderOverview() {
                         <div class="vb-row-title">${esc(name)}</div>
                         <div class="vb-row-desc">${fmt(m.requests)} 次 · 输入 ${compact(inputTokens(m))} · 缓存 ${compact(m.cachedTokens)} · 输出 ${compact(m.outputTokens + m.thoughtsTokens)}</div>
                     </div>
-                    <div class="vb-model-cost">${m.unpriced === m.requests ? '<span class="vb-warn-text">未定价</span>' : money(m.cost)}</div>
+                    <div class="vb-model-cost">${m.unpriced > 0 && m.unpriced === m.requests ? '<span class="vb-warn-text">未定价</span>' : money(m.cost)}</div>
                 </div>
                 <div class="vb-bar"><div style="width:${maxCost > 0 ? (m.cost / maxCost) * 100 : 0}%"></div></div>
             </div>`).join('') : '<div class="vb-placeholder">这段时间还没有 Agent Platform 请求</div>'}
@@ -452,9 +454,11 @@ function renderOverview() {
 
 /* ---------- records ---------- */
 
-async function renderRecords() {
+async function renderRecords({ preserveScroll = false } = {}) {
     const $p = $root().find('[data-panel="records"]');
     if (state.connected === false) return $p.html(disconnectedHtml());
+    const prevList = preserveScroll ? $p.find('.vb-record-list')[0] : null;
+    const prevScrollTop = prevList ? prevList.scrollTop : 0;
     let data;
     try {
         data = await api('/records', { limit: state.recordLimit });
@@ -469,6 +473,10 @@ async function renderRecords() {
         <div class="vb-record-list">${data.items.map(recordItemHtml).join('')}</div>
         ${data.total > data.items.length ? '<div class="menu_button menu_button_icon vb-btn vb-btn-block" data-action="more"><i class="fa-solid fa-chevron-down"></i><span>加载更多</span></div>' : ''}
     `);
+    if (preserveScroll && prevScrollTop > 4) {
+        const nextList = $p.find('.vb-record-list')[0];
+        if (nextList) nextList.scrollTop = prevScrollTop;
+    }
 }
 
 /* ---------- pricing ---------- */
@@ -487,12 +495,21 @@ function hasPriceMatch(pricing, model) {
     return Boolean(pricing[model] || Object.keys(pricing).some(k => model.startsWith(k)));
 }
 
+function pricingRenderSig() {
+    return JSON.stringify([
+        state.settings?.catalogSyncedAt ?? null,
+        Object.keys(state.settings?.pricing || {}),
+        state.summary?.unpricedModels || [],
+    ]);
+}
+
 function renderPricing() {
     const $p = $root().find('[data-panel="pricing"]');
     if (state.connected === false) return $p.html(disconnectedHtml());
     if (!state.settings) return $p.html('<div class="vb-empty"><i class="fa-solid fa-spinner fa-spin"></i></div>');
     const pricing = state.settings.pricing || {};
     const unpriced = state.summary?.unpricedModels || [];
+    lastPricingRenderSig = pricingRenderSig();
 
     const syncedAt = state.settings.catalogSyncedAt;
     const sourceDesc = syncedAt
@@ -545,6 +562,8 @@ function toggleSection(name, label, hint, on, body) {
         </label>
         <div class="vb-toggle-body" data-for="${name}" ${on ? '' : 'style="display:none"'}>${body}</div>`;
 }
+
+const roundRate = (v) => Math.round(Number(v) * 1e6) / 1e6;
 
 const getPath = (o, path) => path.split('.').reduce((x, k) => x?.[k], o);
 
@@ -630,6 +649,37 @@ async function openPriceEditor(key = '', presetModel = '') {
                 apply(['longContextThreshold', 'long.input', 'long.output', 'long.cachedInput']);
             } else { delete out.longContextThreshold; delete out.long; }
 
+            // Keep hidden regional subfields in sync with edits made to base audio / long-context rates.
+            if (out.nonGlobal) {
+                const ratio = out.input > 0 ? out.nonGlobal.input / out.input : 1;
+                const regionalRatioChanged = out.nonGlobal.input !== p.nonGlobal?.input || out.input !== p.input;
+                if (out.inputAudio === undefined) {
+                    delete out.nonGlobal.inputAudio;
+                } else if (out.nonGlobal.inputAudio !== undefined && (out.inputAudio !== p.inputAudio || regionalRatioChanged)) {
+                    out.nonGlobal.inputAudio = roundRate(out.inputAudio * ratio);
+                }
+                if (out.cachedInputAudio === undefined) {
+                    delete out.nonGlobal.cachedInputAudio;
+                } else if (out.nonGlobal.cachedInputAudio !== undefined && (out.cachedInputAudio !== p.cachedInputAudio || regionalRatioChanged)) {
+                    out.nonGlobal.cachedInputAudio = roundRate(out.cachedInputAudio * ratio);
+                }
+                if (!on('hasLong')) {
+                    delete out.nonGlobal.long;
+                } else if (out.nonGlobal.long) {
+                    const longChanged = regionalRatioChanged
+                        || out.long.input !== p.long?.input
+                        || out.long.output !== p.long?.output
+                        || out.long.cachedInput !== p.long?.cachedInput;
+                    if (longChanged) {
+                        out.nonGlobal.long = {
+                            input: roundRate(out.long.input * ratio),
+                            output: roundRate(out.long.output * ratio),
+                            ...(out.long.cachedInput != null ? { cachedInput: roundRate(out.long.cachedInput * ratio) } : {}),
+                        };
+                    }
+                }
+            }
+
             result = { newKey, price: out };
             return true;
         },
@@ -670,9 +720,7 @@ function switchHtml(id, checked) {
     return `<label class="vb-switch"><input type="checkbox" id="${id}" ${checked ? 'checked' : ''}><span class="vb-switch-track"><span class="vb-switch-thumb"></span></span></label>`;
 }
 
-function renderSettings() {
-    const $p = $root().find('[data-panel="settings"]');
-    const p = prefs();
+function settingsStatusInfo() {
     const s = state.summary;
     const statusTitle = state.tauriTavern ? '运行模式' : '服务端插件';
     const statusDesc = state.tauriTavern
@@ -682,14 +730,31 @@ function renderSettings() {
         : (state.connected
             ? `已连接 · 共 ${fmt(s?.total.requests)} 条记录${s?.firstTs ? ` · 统计起点 ${new Date(s.firstTs).toLocaleDateString()}` : ''}`
             : '未连接：请安装服务端插件，在 config.yaml 启用 enableServerPlugins 并重启酒馆');
+    return { statusTitle, statusDesc };
+}
+
+function updateSettingsStatusInPlace() {
+    const $p = $root().find('[data-panel="settings"]');
+    const $desc = $p.find('#vb_status_desc');
+    if (!$desc.length) return false;
+    const { statusDesc } = settingsStatusInfo();
+    $desc.html(statusDesc);
+    $p.find('#vb_status_icon').attr('class', `fa-solid ${state.connected ? 'fa-circle-check vb-ok' : 'fa-circle-xmark vb-danger'} vb-status-icon`);
+    return true;
+}
+
+function renderSettings() {
+    const $p = $root().find('[data-panel="settings"]');
+    const p = prefs();
+    const { statusTitle, statusDesc } = settingsStatusInfo();
 
     $p.html(`
         <div class="vb-row">
             <div class="vb-row-info">
                 <div class="vb-row-title">${statusTitle}</div>
-                <div class="vb-row-desc">${statusDesc}</div>
+                <div id="vb_status_desc" class="vb-row-desc">${statusDesc}</div>
             </div>
-            <i class="fa-solid ${state.connected ? 'fa-circle-check vb-ok' : 'fa-circle-xmark vb-danger'} vb-status-icon"></i>
+            <i id="vb_status_icon" class="fa-solid ${state.connected ? 'fa-circle-check vb-ok' : 'fa-circle-xmark vb-danger'} vb-status-icon"></i>
         </div>
 
         <div class="vb-section-title">显示</div>
@@ -767,7 +832,36 @@ async function loadSettings() {
     }
 }
 
-async function refresh({ toastNew = false } = {}) {
+function stopCatalogPoll() {
+    if (catalogPollTimer) {
+        clearTimeout(catalogPollTimer);
+        catalogPollTimer = null;
+    }
+}
+
+function scheduleCatalogPoll(attemptsLeft = 12) {
+    stopCatalogPoll();
+    if (attemptsLeft <= 0 || !state.settings?.catalogSyncing) return;
+    catalogPollTimer = setTimeout(async () => {
+        catalogPollTimer = null;
+        const prevSyncedAt = state.settings?.catalogSyncedAt;
+        await loadSettings();
+        if (state.settings?.catalogSyncedAt && state.settings.catalogSyncedAt !== prevSyncedAt) {
+            if (!state.tauriTavern) {
+                syncStVertexCompat();
+                restoreSavedGemini4Model();
+            }
+            await refresh({ background: true });
+            return;
+        }
+        if (state.settings?.catalogSyncing) {
+            scheduleCatalogPoll(attemptsLeft - 1);
+        }
+    }, 1500);
+}
+
+async function refresh({ toastNew = false, background = false } = {}) {
+    const prevConnected = lastRenderedConnected;
     try {
         state.summary = await api('/summary', {
             since: periodSince(state.period),
@@ -787,9 +881,10 @@ async function refresh({ toastNew = false } = {}) {
             for (const r of state.summary.latest) {
                 if (r.ts <= state.lastSeenTs) continue;
                 const u = r.usage || {};
+                const input = (u.promptTokenCount || 0) + (u.toolUsePromptTokenCount || 0);
                 toastr.info(
-                    `${esc(r.model)}<br>输入 ${fmt(u.promptTokenCount)} · 输出 ${fmt(u.candidatesTokenCount)}${u.thoughtsTokenCount ? ` · 思考 ${fmt(u.thoughtsTokenCount)}` : ''}<br>今日累计 ${money(state.summary.today.cost)}`,
-                    `本次花费 ${r.cost ? usd(r.cost.total) : '未定价'}`,
+                    `${esc(r.model)}<br>输入 ${fmt(input)} · 输出 ${fmt(u.candidatesTokenCount)}${u.thoughtsTokenCount ? ` · 思考 ${fmt(u.thoughtsTokenCount)}` : ''}<br>今日累计 ${money(state.summary.today.cost)}`,
+                    `本次花费 ${r.cost ? usd(r.cost.total) : (r.usage ? '未定价' : '无用量')}`,
                     { timeOut: 6000, escapeHtml: false },
                 );
             }
@@ -798,6 +893,21 @@ async function refresh({ toastNew = false } = {}) {
     }
 
     updateHeader();
+    const connectionChanged = prevConnected !== state.connected;
+    lastRenderedConnected = state.connected;
+
+    if (background && !connectionChanged) {
+        if (state.tab === 'overview') {
+            renderOverview();
+        } else if (state.tab === 'records') {
+            renderRecords({ preserveScroll: true });
+        } else if (state.tab === 'settings') {
+            if (!updateSettingsStatusInPlace()) renderSettings();
+        } else if (state.tab === 'pricing') {
+            if (pricingRenderSig() !== lastPricingRenderSig) renderPricing();
+        }
+        return;
+    }
     renderTab(state.tab);
 }
 
@@ -811,7 +921,12 @@ function bindEvents() {
     $r.on('click', '[data-action="retry"]', async () => {
         try { await ensureBackend(); } catch (e) { state.initError = e.message; }
         await loadSettings();
-        if (!state.tauriTavern) syncStVertexCompat();
+        if (!state.tauriTavern) {
+            initStVertexCompat();
+            syncStVertexCompat();
+            restoreSavedGemini4Model();
+        }
+        if (state.settings?.catalogSyncing) scheduleCatalogPoll();
         refresh();
     });
     $r.on('click', '[data-action="goto-pricing"]', () => switchTab('pricing'));
@@ -838,7 +953,10 @@ function bindEvents() {
         try {
             const res = await api('/catalog/sync');
             await loadSettings();
-            if (!state.tauriTavern) syncStVertexCompat();
+            if (!state.tauriTavern) {
+                syncStVertexCompat();
+                restoreSavedGemini4Model();
+            }
             await refresh();
             const parts = [];
             if (res.added) parts.push(`新增 ${res.added} 个`);
@@ -897,7 +1015,32 @@ function bindEvents() {
     });
 }
 
-jQuery(async () => {
+function bindStEvents() {
+    if (state.tauriTavern) return;
+    const c = ctx();
+    const { eventSource } = c;
+    const eventTypes = c.event_types || c.eventTypes || {};
+    if (!eventSource) return;
+
+    const onGenerationDone = () => {
+        // Streamed responses are recorded when the upstream SSE ends, which can land slightly after the client finishes.
+        setTimeout(() => refresh({ toastNew: true, background: true }), 300);
+        setTimeout(() => refresh({ toastNew: true, background: true }), 2000);
+    };
+    if (eventTypes.GENERATION_ENDED) eventSource.on(eventTypes.GENERATION_ENDED, onGenerationDone);
+    if (eventTypes.GENERATION_STOPPED) eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationDone);
+
+    if (eventTypes.APP_READY) {
+        eventSource.on(eventTypes.APP_READY, () => {
+            if (!state.settings) return;
+            initStVertexCompat();
+            syncStVertexCompat();
+            restoreSavedGemini4Model();
+        });
+    }
+}
+
+async function doInit() {
     $('#extensions_settings2').append(shellHtml());
     bindEvents();
     switchTab('overview');
@@ -910,17 +1053,47 @@ jQuery(async () => {
     }
 
     await loadSettings();
-    if (!state.tauriTavern) initStVertexCompat();
     await refresh();
 
     if (!state.tauriTavern) {
-        const { eventSource, eventTypes } = ctx();
-        const onGenerationDone = () => {
-            // Streamed responses are recorded when the upstream SSE ends, which can land slightly after the client finishes.
-            setTimeout(() => refresh({ toastNew: true }), 300);
-            setTimeout(() => refresh({ toastNew: true }), 2000);
-        };
-        eventSource.on(eventTypes.GENERATION_ENDED, onGenerationDone);
-        eventSource.on(eventTypes.GENERATION_STOPPED, onGenerationDone);
+        initStVertexCompat();
+        syncStVertexCompat();
+        restoreSavedGemini4Model();
+        bindStEvents();
     }
-});
+    if (state.settings?.catalogSyncing) scheduleCatalogPoll();
+}
+
+export function init() {
+    return (initPromise ??= doInit());
+}
+
+export async function onClean() {
+    stopCatalogPoll();
+    if (ttBackend) {
+        await ttBackend.dispose().catch(() => {});
+        ttBackend = null;
+    }
+    const c = ctx();
+    if (c.extensionSettings && MODULE in c.extensionSettings) {
+        delete c.extensionSettings[MODULE];
+        c.saveSettingsDebounced?.();
+    }
+}
+
+function isLoadedAsScriptTag() {
+    try {
+        return Array.from(document.scripts).some(s => s.src === import.meta.url);
+    } catch {
+        return false;
+    }
+}
+
+// Enabled extensions are inserted as a <script> tag on all ST versions (including < 1.17.0 without hooks.activate),
+// whereas disabled extensions dynamically imported only for `onClean` have no matching <script> tag in the DOM.
+if (isTauriTavern() || isLoadedAsScriptTag()) {
+    jQuery(() => { init(); });
+    if (isTauriTavern()) {
+        window.addEventListener('pagehide', () => { ttBackend?.dispose?.(); });
+    }
+}
